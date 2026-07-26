@@ -1,0 +1,86 @@
+# ============================================================
+# Enterprise RAG System - Configuration
+# ============================================================
+
+# --- Model Selection ---
+models:
+  # Embedding model for vectorization
+  embedding:
+    provider: "dashscope"          # openai | huggingface | local | dashscope
+    model_name: "text-embedding-v4"
+    dimension: 1024
+    batch_size: 32
+
+  # LLM for answer generation
+  llm:
+    provider: "deepseek"          # openai | ollama | vllm | anthropic | dashscope | deepseek
+    model_name: "deepseek-v4-pro"
+    temperature: 0.1
+    max_tokens: 2048
+
+  # Reranker model
+  reranker:
+    provider: "huggingface"     # huggingface | cohere | jina
+    model_name: "BAAI/bge-reranker-v2-m3"
+    top_k: 5
+
+# --- Vector Store (Qdrant) ---
+qdrant:
+  host: "localhost"
+  port: 6333
+  grpc_port: 6334
+  prefer_grpc: false
+  api_key: null                # set via env: QDRANT_API_KEY
+  collection_name: "rag_documents"
+  vector_size: 1024
+  distance: "Cosine"           # Cosine | Euclidean | Dot
+
+# --- Document Processing ---
+document:
+  chunk_size: 512
+  chunk_overlap: 50
+  supported_formats:
+    - "pdf"
+    - "docx"
+    - "txt"
+    - "md"
+    - "html"
+    - "csv"
+
+# --- Retrieval ---
+retrieval:
+  top_k: 10
+  retrieval_type: "hybrid"     # dense | sparse | hybrid
+  fusion_method: "rrf"         # rrf | weighted_score
+  dense_weight: 0.7
+  sparse_weight: 0.3
+
+# --- Cache ---
+cache:
+  enabled: true
+  backend: "redis"             # redis | memory | disk
+  redis_host: "localhost"
+  redis_port: 6379
+  ttl_seconds: 3600
+  semantic_enabled: true       # 是否启用语义缓存（需要 Redis Stack）
+  similarity_threshold: 0.92   # 语义命中最低余弦相似度（0~1）
+  vec_dim: 1024                # embedding 向量维度（须与模型匹配）
+
+# --- Logging ---
+logging:
+  level: "INFO"                # DEBUG | INFO | WARNING | ERROR
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: "logs/rag.log"
+  console: true
+
+# --- API Server ---
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  reload: true                 # auto-reload in dev
+
+# --- Streamlit ---
+streamlit:
+  port: 8501
+  theme: "light"
