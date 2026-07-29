@@ -25,7 +25,7 @@ RAG 问答链 —— 串联检索、Prompt 模板与 LLM 生成。
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict,Generator, List, Optional
 
 from langchain_core.documents import Document
 
@@ -63,7 +63,10 @@ DEFAULT_RAG_PROMPT = (
     "  - 如果文档内容不足以回答问题，请明确告知用户\"当前知识库中暂无相关资料\"\n"
     "  - 在回答末尾列出引用的文档来源（文件名）\n"
     "\n"
-    "**情况二：用户的问题与文档内容无关（如问候、闲聊、通用知识问题等）**\n"
+    "**情况二：文档内容为\"未检索到相关文档\"**\n"
+    "  - 请明确告知用户\"当前知识库中暂无相关资料，请补充后再提问\"\n"
+    "\n"
+    "**情况三：用户的问题与文档内容无关（如问候、闲聊、通用知识问题等）**\n"
     "  - 以友好、自然的方式直接回答，无需引用文档\n"
     "  - 保持专业且亲切的语气\n"
     "\n"
@@ -119,6 +122,85 @@ class RAGChain:
         return self._cache
 
     # ── 主入口 ────────────────────────────────────────────────────────
+
+    def answer_stream(self, question: str) -> Generator[Dict[str, Any], None, None]:
+        """流式 RAG 问答：先检索，再流式生成。
+
+        Yields:
+            {"type": "status", "content": "检索中..."}
+            {"type": "status", "content": "思考中..."}
+            {"type": "token", "content": "<文本片段>"}
+            {"type": "sources", "content": [...]}
+            {"type": "done", "content": "<完整回答>"}
+        """
+        if not question.strip():
+            yield {"type": "error", "content": "问题为空"}
+            return
+
+        # 1. 检查缓存
+        if self._use_cache:
+            try:
+                cache = self._get_cache()
+                cached = cache.get(question)
+                if cached:
+                    logger.info("缓存命中(流式): %s...", question[:40])
+                    yield {"type": "token", "content": cached.get("answer", "")}
+                    yield {"type": "sources", "content": cached.get("source_metadata", [])}
+                    yield {"type": "done", "content": cached.get("answer", "")}
+                    return
+            except Exception as exc:
+                logger.warning("缓存读取失败: %s", exc)
+
+        # 2. 检索
+        yield {"type": "status", "content": "🔍 正在检索相关知识库..."}
+        try:
+            retrieved_docs = pipeline_retrieve(
+                query=question,
+                candidate_top_n=self._top_k,
+                use_reranker=True,
+            )
+        except Exception as exc:
+            logger.error("检索失败: %s", exc)
+            yield {"type": "error", "content": f"检索失败: {exc}"}
+            return
+
+        if not retrieved_docs:
+            yield {"type": "status", "content": "⚠️ 未检索到相关文档，尝试基于自身知识回答..."}
+            retrieved_docs = []
+
+        # 3. 构建 Prompt
+        context = self._build_context(retrieved_docs) if retrieved_docs else "未检索到相关文档"
+        prompt = self._prompt_template.format(context=context, question=question)
+
+        # 4. 流式生成
+        yield {"type": "status", "content": "💭 正在思考..."}
+        source_metadata = self._extract_source_metadata(retrieved_docs) if retrieved_docs else []
+        full_text = ""
+
+        try:
+            for info in self.llm.stream(prompt):
+                token = info["token"]
+                full_text += token
+                yield {"type": "token", "content": token}
+        except Exception as exc:
+            logger.error("LLM 流式生成失败: %s", exc)
+            yield {"type": "error", "content": f"生成失败: {exc}"}
+            return
+
+        # 5. 写入缓存
+        if self._use_cache and full_text:
+            try:
+                cache_entry = {
+                    "question": question,
+                    "answer": full_text,
+                    "source_metadata": source_metadata,
+                }
+                self._get_cache().set(question, cache_entry)
+            except Exception:
+                pass
+
+        yield {"type": "sources", "content": source_metadata}
+        yield {"type": "done", "content": full_text}
 
     def answer(self, question: str) -> Dict[str, Any]:
         """对用户问题执行完整的 RAG 问答流程。

@@ -29,7 +29,6 @@ from qdrant_client.models import (
     SparseVectorParams,
     VectorParams,
 )
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 from src.llms.models import ModelFactory
 from src.utils.config import get_config
@@ -128,7 +127,6 @@ class SparseEncoder:
 
         # FastEmbed 的 embed() 返回 List[SparseEmbedding]，每个元素有 .indices 和 .values
         results = list(self._fast_model.embed([text]))  # type: ignore[union-attr]
-        logger.info("FastEmbed 编码结果: %s", results)
         if not results:
             return [], []
 
@@ -310,10 +308,10 @@ class QdrantVectorStore:
                     id=point_id,
                     vector={
                         "dense": dense_vec,
-                        "sparse": {
-                            "indices": sparse_indices,
-                            "values": sparse_values,
-                        },
+                        "sparse": models.SparseVector(
+                            indices=sparse_indices,
+                            values=sparse_values,
+                        ),
                     },
                     payload=payload,
                 )
@@ -393,6 +391,7 @@ class QdrantVectorStore:
             score_threshold=score_threshold,
             with_payload=True
         )
+        logger.info("稠密检索完成，检索到：%d 条", len(results.points))
 
         return self._hits_to_documents(results.points)
 
@@ -400,6 +399,7 @@ class QdrantVectorStore:
         self,
         query: str,
         top_k: int = 10,
+        score_threshold: Optional[float] = None,
     ) -> List[Document]:
         """稀疏（BM25）关键词检索。
 
@@ -413,15 +413,24 @@ class QdrantVectorStore:
         self._ensure_sparse_fitted()
         indices, values = self._sparse_encoder.encode(query)
         if not indices:
+            logger.warning("稀疏编码返回空向量，跳过检索: query='%s'", query[:50])
             return []
+
+        logger.info(
+            "发起稀疏检索: query='%s', indices_count=%d",
+            query[:50],
+            len(indices),
+        )
 
         results = self._client.query_points(
             collection_name=self._chunk_collection,
             query=models.SparseVector(indices=indices, values=values),
             using="sparse",
             limit=top_k,
+            score_threshold=score_threshold,
             with_payload=True,
         )
+        logger.info("稀疏检索完成，检索到：%d 条", len(results.points))
 
         return self._hits_to_documents(results.points)
 
@@ -446,7 +455,9 @@ class QdrantVectorStore:
         Returns:
             Document 列表。
         """
+        logger.info("自查询发起检索: query='%s', filter=%s", query[:50], filter_conditions)
         qdrant_filter = self._build_filter(filter_conditions)
+        logger.info("Qdrant 过滤条件: %s", qdrant_filter)
 
         if search_mode == "dense":
             query_vec = self._get_dense_vector(query)
@@ -583,24 +594,54 @@ class QdrantVectorStore:
 
     @staticmethod
     def _build_filter(conditions: Dict[str, Any]) -> Optional[Filter]:
-        """将 dict 条件转换为 Qdrant Filter 对象。"""
+        """将 dict 条件转换为 Qdrant Filter 对象。
+        支持两种格式：
+        1. Qdrant 原生格式（LLM 自查询生成）：
+           {"must": [{"key": "field", "match": {"value": "x"}}, ...]}
+        2. 简化字典格式：
+           {"field": "value", "tags": ["a", "b"], "page": {"gte": 1, "lte": 10}}
+        """
         if not conditions:
             return None
 
         must_clauses: List[FieldCondition] = []
-        for key, value in conditions.items():
-            if isinstance(value, list):
-                must_clauses.append(
-                    FieldCondition(key=key, match=MatchAny(any=value))
-                )
-            elif isinstance(value, dict) and ("gte" in value or "lte" in value):
-                must_clauses.append(
-                    FieldCondition(key=key, range=Range(**value))
-                )
-            else:
-                must_clauses.append(
-                    FieldCondition(key=key, match=MatchValue(value=value))
-                )
+
+        if "must" in conditions and isinstance(conditions["must"], list):
+            for clause in conditions["must"]:
+                key = clause.get("key")
+                match_info = clause.get("match")
+                range_info = clause.get("range")
+
+                if not key:
+                    continue
+
+                if match_info:
+                    if "value" in match_info:
+                        must_clauses.append(
+                            FieldCondition(key=key, match=MatchValue(value=match_info["value"]))
+                        )
+                    elif "any" in match_info:
+                        must_clauses.append(
+                            FieldCondition(key=key, match=MatchAny(any=match_info["any"]))
+                        )
+                elif range_info:
+                    must_clauses.append(
+                        FieldCondition(key=key, range=Range(**range_info))
+                    )
+        else:
+            for key, value in conditions.items():
+                if isinstance(value, list):
+                    must_clauses.append(
+                        FieldCondition(key=key, match=MatchAny(any=value))
+                    )
+                elif isinstance(value, dict) and ("gte" in value or "lte" in value):
+                    must_clauses.append(
+                        FieldCondition(key=key, range=Range(**value))
+                    )
+                else:
+                    must_clauses.append(
+                        FieldCondition(key=key, match=MatchValue(value=value))
+                    )
 
         return Filter(must=must_clauses) if must_clauses else None
 

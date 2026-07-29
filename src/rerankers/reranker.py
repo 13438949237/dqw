@@ -32,17 +32,24 @@ class Reranker:
         provider: Optional[str] = None,
         model_name: Optional[str] = None,
         top_k: Optional[int] = None,
+        score_threshold: Optional[float] = None,
     ) -> None:
         """
         Args:
             provider:   重排序后端，None 则使用 config.yaml 默认值。
             model_name: 模型名称，None 则使用 config.yaml 默认值。
             top_k:      默认返回数量，None 则使用 config.yaml 默认值。
+            score_threshold: 最低相关度阈值，低于此值的文档将被过滤。
         """
         cfg = get_config()
         self._provider = provider or cfg.models.reranker.provider
         self._model_name = model_name or cfg.models.reranker.model_name
         self._default_top_k = top_k or cfg.models.reranker.top_k
+        self._score_threshold = (
+            score_threshold
+            if score_threshold is not None
+            else cfg.models.reranker.score_threshold
+        )
         self._model: Optional[BaseReranker] = None
 
     @property
@@ -73,6 +80,7 @@ class Reranker:
 
         Returns:
             按相关性分数降序排列的 Document 列表，meta 中额外包含 rerank_score。
+            低于 score_threshold 的文档会被过滤。
         """
         if not documents:
             return []
@@ -92,11 +100,27 @@ class Reranker:
 
         # 按秩重新排列并注入分值
         results: List[Document] = []
+        filtered_count = 0
         for idx, score in ranked_pairs:
             doc = documents[idx]
-            doc.metadata["rerank_score"] = round(float(score), 6)
+            score_val = round(float(score), 6)
+
+            if score_val < self._score_threshold:
+                filtered_count += 1
+                logger.info("重排序得分低于阈值的检索结果: %s", doc.page_content)
+                continue
+
+            doc.metadata["rerank_score"] = score_val
             doc.metadata["rerank_rank"] = len(results)
             results.append(doc)
+
+
+        if filtered_count > 0:
+            logger.info(
+                "阈值过滤: %d 条文档低于阈值 %.4f 被丢弃",
+                filtered_count,
+                self._score_threshold,
+            )
 
         logger.info(
             "重排序完成: %d 条候选 → %d 条精排 (model=%s/%s)",

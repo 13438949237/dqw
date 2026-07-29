@@ -63,6 +63,7 @@ API 文档自动生成于 `http://localhost:8000/docs`。
 
 ```bash
 streamlit run app/streamlit/app.py
+streamlit run D:\AiApplication\projects\RAG\app\streamlit\document_manage.py --server.port 8502
 ```
 
 ## 技术栈

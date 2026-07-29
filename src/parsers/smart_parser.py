@@ -17,6 +17,181 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# 允许上传的文件格式
+# ============================================================================
+
+# 纯文本格式（使用传统解析器）
+_TEXT_FORMATS  = frozenset({".txt", ".md"})
+
+# 复杂格式（优先使用 MinerU flash 解析，不可用时回退传统解析器）
+_COMPLEX_FORMATS = frozenset({
+    ".pdf",
+    ".png", ".jpg", ".jpeg", ".bmp", ".tiff",
+    ".docx", ".pptx",
+    ".xlsx", ".xls",
+})
+
+# 全部允许的扩展名
+ALLOWED_EXTENSIONS: frozenset = _TEXT_FORMATS | _COMPLEX_FORMATS
+
+
+def is_supported_format(filename: str) -> bool:
+    """判断文件扩展名是否在允许列表中。
+
+    Args:
+        filename: 文件名或完整路径。
+
+    Returns:
+        True 表示支持该格式。
+    """
+    suffix = Path(filename).suffix.lower()
+    return suffix in ALLOWED_EXTENSIONS
+
+
+# ============================================================================
+# MinerU Flash 解析器 —— 统一处理 PDF / 图片 / DOCX / PPTX / XLSX
+# ============================================================================
+
+# 由 MinerU flash 引擎处理的格式集合
+_MINERU_FORMATS = frozenset({
+    ".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".docx", ".pptx", ".xlsx", ".xls",
+})
+
+# MinerU 可用性标记：None=未检测 / True=可用 / False=不可用（遇 SSL 错误等重要异常后置为 False）
+_mineru_available: Optional[bool] = None
+
+
+def _check_mineru() -> bool:
+    """检测 MinerU 是否可用，首次调用时会尝试导入并快速探测。
+
+    如果 langchain-mineru 未安装，或导入/加载时发生 SSL / 连接错误，
+    则将 _mineru_available 置为 False，后续调用直接走回退解析器，
+    避免每次上传都触发长时间的 SSL 超时。
+
+    Returns:
+        True 表示 MinerU 可用。
+    """
+    global _mineru_available
+
+    if _mineru_available is not None:
+        return _mineru_available
+
+    try:
+        # 实际触发导入 —— 这里可能抛出 ImportError 或 SSL 错误
+        from langchain_mineru.document_loaders import MinerULoader  # noqa: F401
+        _mineru_available = True
+        logger.info("MinerU flash 解析器可用")
+    except ImportError as exc:
+        logger.warning("langchain-mineru 未安装，将使用传统解析器: %s", exc)
+        _mineru_available = False
+    except Exception as exc:
+        # 包括 httpx.ConnectError / SSL 错误等
+        logger.warning(
+            "MinerU 初始化失败（网络/SSL 错误），将使用传统解析器: %s", exc
+        )
+        _mineru_available = False
+
+    return _mineru_available
+
+
+def parse_with_mineru(file_path: str) -> ParsedDocument:
+    """使用 langchain-mineru 的 flash 模式解析复杂文档格式。
+
+    MinerU flash 模式利用轻量级流水线实现快速解析，适用于 PDF、
+    图片（PNG/JPG/BMP/TIFF）、DOCX、PPTX、XLSX 等多格式。
+    若 MinerU 不可用，回退到对应传统解析器。
+
+    Args:
+        file_path: 本地文件路径。
+
+    Returns:
+        ParsedDocument 结构化中间表示。
+    """
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+
+    # ── MinerU 可用性检查 ──
+    if not _check_mineru():
+        logger.info("MinerU 不可用，直接回退传统解析: %s", path.name)
+        return _fallback_parse(file_path, suffix)
+
+    # ── 尝试 MinerU 解析 ──
+    try:
+        from langchain_mineru.document_loaders import MinerULoader  # noqa: F811
+
+        logger.info("使用 MinerU flash 模式解析: %s", path.name)
+        loader = MinerULoader(source=str(path), mode="flash")
+        docs = loader.load()
+
+        blocks: List[ParsedBlock] = []
+        for doc in docs:
+            text = doc.page_content
+            if not text.strip():
+                continue
+            page = doc.metadata.get("page_number", doc.metadata.get("page", 1))
+            page_num = int(page) if page else 1
+
+            paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+            if not paragraphs:
+                paragraphs = [text.strip()]
+
+            for para in paragraphs:
+                blocks.append(
+                    ParsedBlock(
+                        block_type="paragraph",
+                        content=para,
+                        page=page_num,
+                    )
+                )
+
+        if not blocks:
+            logger.warning("MinerU 未提取到文本内容: %s", path.name)
+            return ParsedDocument(
+                doc_id=f"mineru:{path.stem}",
+                source=path.name,
+                file_type=suffix.lstrip("."),
+            )
+
+        logger.info(
+            "MinerU 解析完成: %s, %d 块", path.name, len(blocks)
+        )
+        return ParsedDocument(
+            doc_id=f"mineru:{path.stem}",
+            source=path.name,
+            file_type=suffix.lstrip("."),
+            blocks=blocks,
+        )
+
+    except ImportError:
+        logger.warning("MinerU 导入失败，回退传统解析: %s", path.name)
+        return _fallback_parse(file_path, suffix)
+
+    except Exception as exc:
+        logger.warning("MinerU 解析异常 (%s)，回退传统解析: %s", exc, path.name)
+        return _fallback_parse(file_path, suffix)
+
+
+def _fallback_parse(file_path: str, suffix: str) -> ParsedDocument:
+    """MinerU 失败时的回退解析（路由到原有传统解析器）。"""
+    path = Path(file_path)
+
+    if suffix in (".pdf",):
+        return parse_pdf(file_path)
+    if suffix in (".docx", ".doc"):
+        return parse_docx(file_path)
+    if suffix in (".xlsx", ".xls"):
+        return parse_xlsx(file_path)
+    if suffix in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".pptx"):
+        return ParsedDocument(
+            doc_id=f"fallback:{path.stem}",
+            source=path.name,
+            file_type=suffix.lstrip("."),
+        )
+    # 兜底：当纯文本处理
+    return parse_text(file_path)
+
+
+# ============================================================================
 # 解析结果数据结构
 # ============================================================================
 
@@ -50,42 +225,71 @@ class ParsedDocument:
 
 
 def parse_pdf(file_path: str) -> ParsedDocument:
-    """使用 pypdf 解析 PDF 文档，按页提取文本。"""
+    """使用 pdfplumber 解析 PDF 文档，支持文本和表格提取。"""
     try:
-        from pypdf import PdfReader
+        import pdfplumber
     except ImportError as exc:
         raise ImportError(
-            "PDF 解析需要安装 pypdf，请执行: pip install pypdf"
+            "PDF 解析需要安装 pdfplumber，请执行: pip install pdfplumber"
         ) from exc
 
     path = Path(file_path)
-    reader = PdfReader(file_path)
     blocks: List[ParsedBlock] = []
 
-    for page_idx, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        if not text.strip():
-            continue
+    with pdfplumber.open(file_path) as pdf:
+        total_pages = len(pdf.pages)
+        for page_idx, page in enumerate(pdf.pages, start=1):
+            # 1. 提取表格
+            tables = page.extract_tables() or []
+            table_regions = []
+            for table in tables:
+                if not table:
+                    continue
+                rows = []
+                for row in table:
+                    cells = [str(c).strip() if c else "" for c in row]
+                    rows.append(" | ".join(cells))
+                if rows:
+                    blocks.append(
+                        ParsedBlock(
+                            block_type="table",
+                            content="\n".join(rows),
+                            page=page_idx,
+                        )
+                    )
+                # 记录表格区域，后续排除
+                if table:
+                    for row in table:
+                        for cell in row:
+                            if cell:
+                                table_regions.append(cell.strip())
 
-        # 按双换行切为段落
-        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-        for para in paragraphs:
-            blocks.append(
-                ParsedBlock(
-                    block_type="paragraph",
-                    content=para,
-                    page=page_idx,
+            # 2. 提取文本（排除已提取的表格内容）
+            text = page.extract_text() or ""
+            if not text.strip():
+                continue
+
+            paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+            for para in paragraphs:
+                # 跳过已被表格覆盖的内容
+                if any(cell in para for cell in table_regions if len(cell) > 5):
+                    continue
+                blocks.append(
+                    ParsedBlock(
+                        block_type="paragraph",
+                        content=para,
+                        page=page_idx,
+                    )
                 )
-            )
 
     doc = ParsedDocument(
         doc_id=f"pdf:{path.stem}",
         source=path.name,
         file_type="pdf",
         blocks=blocks,
-        total_pages=len(reader.pages),
+        total_pages=total_pages,
     )
-    logger.info("PDF 解析完成: %s, %d 页, %d 段落", path.name, doc.total_pages, len(blocks))
+    logger.info("PDF 解析完成: %s, %d 页, %d 块", path.name, doc.total_pages, len(blocks))
     return doc
 
 
@@ -314,16 +518,23 @@ def parse_text(file_path: str) -> ParsedDocument:
 
 # 扩展名 → 解析器映射
 _PARSER_REGISTRY: Dict[str, callable] = {
-    ".pdf":  parse_pdf,
-    ".docx": parse_docx,
-    ".doc":  parse_docx,
-    ".md":   parse_markdown,
-    ".xlsx": parse_xlsx,
-    ".xls":  parse_xlsx,
+    # ── 纯文本（传统解析器） ──
     ".txt":  parse_text,
-    ".csv":  parse_text,
+    ".md":   parse_markdown,
     ".html": parse_text,
     ".htm":  parse_text,
+    ".csv":  parse_text,
+    # ── 复杂格式（MinerU flash 解析器） ──
+    ".pdf":  parse_with_mineru,
+    ".png":  parse_with_mineru,
+    ".jpg":  parse_with_mineru,
+    ".jpeg": parse_with_mineru,
+    ".bmp":  parse_with_mineru,
+    ".tiff": parse_with_mineru,
+    ".docx": parse_with_mineru,
+    ".pptx": parse_with_mineru,
+    ".xlsx": parse_with_mineru,
+    ".xls":  parse_with_mineru,
 }
 
 
@@ -340,10 +551,13 @@ def parse_file(file_path: str) -> ParsedDocument:
         ValueError: 不支持的扩展名。
     """
     suffix = Path(file_path).suffix.lower()
-    parser = _PARSER_REGISTRY.get(suffix)
-    if parser is None:
+
+    # ── 格式白名单校验 ──
+    if suffix not in ALLOWED_EXTENSIONS:
         raise ValueError(
-            f"不支持的文件类型: {suffix}。"
-            f"当前支持: {', '.join(_PARSER_REGISTRY.keys())}"
+            f"不支持该文件类型 (.{suffix})，请选择规定类型的文件。"
+            f"允许的格式: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
         )
+
+    parser = _PARSER_REGISTRY.get(suffix)
     return parser(file_path)

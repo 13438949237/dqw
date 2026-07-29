@@ -59,7 +59,7 @@ class HybridRetriever:
     def __init__(
         self,
         vector_store: QdrantVectorStore,
-        top_k: int = 100,
+        top_k: int = 20, # 检索数量上限
         weights: Optional[Dict[str, float]] = None,
     ) -> None:
         """
@@ -131,7 +131,7 @@ class HybridRetriever:
             else:
                 return []
         except Exception as exc:
-            logger.warning("%s 检索异常: %s", mode, exc)
+            logger.warning("%s 检索异常: %s", mode, exc, exc_info=True)
             return []
 
     def _safe_retrieve_self_query(self, query: str) -> List[Document]:
@@ -157,6 +157,7 @@ class HybridRetriever:
         try:
             prompt = self.SELF_QUERY_PROMPT.format(query=query)
             resp = self.llm.invoke([HumanMessage(content=prompt)])
+            logger.info("自查询 LLM 调用返回结果: %s", resp)
             raw = resp.content.strip() if hasattr(resp, "content") else str(resp).strip()
         except Exception as exc:
             logger.warning("自查询 LLM 调用失败: %s", exc)
@@ -177,10 +178,10 @@ class HybridRetriever:
 
         # 空对象 = 无过滤意图
         if not parsed or not parsed.get("must"):
-            logger.debug("自查询：无过滤意图")
+            logger.warning("自查询：无过滤意图")
             return None
 
-        logger.debug("自查询 filter: %s", parsed)
+        logger.info("自查询 filter: %s", parsed)
         return parsed
 
     # ── RRF 融合 ───────────────────────────────────────────────────────
@@ -203,16 +204,18 @@ class HybridRetriever:
         doc_map: Dict[str, Tuple[Document, float]] = {}
 
         for route_name, docs in routes.items():
-            weight = weights.get(route_name, 1.0)
+            weight = weights.get(route_name, 1.0)   # 取该路权重，默认 1.0
             for rank, doc in enumerate(docs):
+                # 用 qdrant_id 作为去重 key
                 qdrant_id = doc.metadata.get("qdrant_id", "")
                 if not qdrant_id:
                     # 无 qdrant_id 时用 page_content hash 做去重
                     qdrant_id = str(hash(doc.page_content))
-
+                # 计算该文档在本路的 RRF 贡献， rank+1 使排名从 1 开始
                 rrf_score = weight / (cls.RRF_K + rank + 1)
 
                 if qdrant_id in doc_map:
+                    # 同一文档出现在多路中 → 累加分数
                     _, existing_score = doc_map[qdrant_id]
                     doc_map[qdrant_id] = (doc, existing_score + rrf_score)
                 else:
@@ -221,9 +224,9 @@ class HybridRetriever:
         # 按 RRF 分数降序，取 top_k
         sorted_docs = sorted(
             doc_map.values(),
-            key=lambda x: x[1],
-            reverse=True,
-        )[:top_k]
+            key=lambda x: x[1], # 按 RRF 分数排序
+            reverse=True,   # 降序（分数高的在前）
+        )[:top_k]   # 只取前 top_k 个
 
         result = []
         for doc, rrf_score in sorted_docs:

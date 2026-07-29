@@ -98,8 +98,14 @@ async def upload_file(file: UploadFile = File(...)):
     from src.utils.config import get_config
     cfg = get_config()
     suffix = Path(file.filename).suffix.lower().lstrip(".")
-    if suffix not in cfg.document.supported_formats:
-        raise HTTPException(status_code=400, detail="Unsupported format: "+suffix)
+    allowed = getattr(cfg.document, "supported_formats", ["pdf", "docx", "txt", "md"])
+    from src.parsers.smart_parser import ALLOWED_EXTENSIONS
+    allowed = list(ALLOWED_EXTENSIONS)
+    if suffix not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持该文件类型 (.{suffix})，请选择规定类型的文件。允许: {', '.join(sorted(allowed))}"
+        )
     tmp_dir = tempfile.mkdtemp(prefix="rag_upload_")
     tmp_path = os.path.join(tmp_dir, file.filename)
     try:

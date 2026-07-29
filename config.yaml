@@ -22,7 +22,8 @@ models:
   reranker:
     provider: "huggingface"     # huggingface | cohere | jina
     model_name: "BAAI/bge-reranker-v2-m3"
-    top_k: 5
+    top_k: 10
+    score_threshold: 0.5       # rerank 最低相关度阈值，低于此值的文档不返回(0 表示不过滤)
 
 # --- Vector Store (Qdrant) ---
 qdrant:
@@ -44,12 +45,11 @@ document:
     - "docx"
     - "txt"
     - "md"
-    - "html"
     - "csv"
 
 # --- Retrieval ---
 retrieval:
-  top_k: 10
+  top_k: 20
   retrieval_type: "hybrid"     # dense | sparse | hybrid
   fusion_method: "rrf"         # rrf | weighted_score
   dense_weight: 0.7
@@ -84,3 +84,11 @@ server:
 streamlit:
   port: 8501
   theme: "light"
+
+# --- PostgreSQL 会话持久化 ---
+postgresql:
+  host: "localhost"
+  port: 5432
+  user: rag_user
+  password: dqw19970501
+  database: "rag_sessions"

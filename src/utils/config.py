@@ -59,7 +59,8 @@ class RerankerConfig(BaseModel):
     """重排序模型配置。"""
     provider: str = "huggingface"
     model_name: str = "BAAI/bge-reranker-v2-m3"
-    top_k: int = 5
+    top_k: int = 10
+    score_threshold: float = 0.0
 
 
 class ModelsConfig(BaseModel):
@@ -86,13 +87,13 @@ class DocumentConfig(BaseModel):
     chunk_size: int = 512
     chunk_overlap: int = 50
     supported_formats: list[str] = Field(
-        default_factory=lambda: ["pdf", "docx", "txt", "md", "html", "csv"]
+        default_factory=lambda: ["md", "txt", "pdf", "png", "jpg", "jpeg", "bmp", "tiff", "docx", "pptx", "xlsx", "xls", "html", "csv"]
     )
 
 
 class RetrievalConfig(BaseModel):
     """检索策略参数。"""
-    top_k: int = 10
+    top_k: int = 20
     retrieval_type: str = "hybrid"
     fusion_method: str = "rrf"
     dense_weight: float = 0.7
@@ -131,6 +132,15 @@ class StreamlitConfig(BaseModel):
     """Streamlit 前端配置。"""
     port: int = 8501
     theme: str = "light"
+
+
+class PostgresConfig(BaseModel):
+    """PostgreSQL 会话持久化配置（Docker 部署）。"""
+    host: str = "localhost"
+    port: int = 5432
+    user: str = "rag_user"
+    password: str = "rag_password"
+    database: str = "rag_sessions"
 
 
 class ApiKeysConfig(BaseModel):
@@ -173,6 +183,7 @@ class AppConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     streamlit: StreamlitConfig = Field(default_factory=StreamlitConfig)
+    postgresql: PostgresConfig = Field(default_factory=PostgresConfig)
     api_keys: ApiKeysConfig = Field(default_factory=ApiKeysConfig)
 
 

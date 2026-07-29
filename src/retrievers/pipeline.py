@@ -65,7 +65,7 @@ def _get_reranker() -> Reranker:
 def retrieve(
     query: str,
     top_k: Optional[int] = None,
-    candidate_top_n: int = 100,
+    candidate_top_n: Optional[int] = None,
     use_reranker: bool = True,
 ) -> List[Document]:
     """端到端检索接口。
@@ -85,7 +85,8 @@ def retrieve(
         ...     print(d.metadata.get("rerank_score"), d.page_content[:50])
     """
     cfg = get_config().retrieval
-    top_k = top_k or cfg.top_k
+    top_k = top_k or get_config().models.reranker.top_k
+    candidate_top_n = candidate_top_n or cfg.top_k
 
     # ── 1. 多路混合检索 ────────────────────────────────────────────────
     retriever = HybridRetriever(
@@ -116,9 +117,10 @@ def retrieve(
         doc.metadata.pop("rrf_rank", None)
 
     logger.info(
-        "检索管线完成: query='%s' → %d 条结果 (rerank=%s)",
+        "检索管线完成: query='%s' → %d 条结果：%s (rerank=%s)",
         query[:60],
         len(results),
+        results,
         use_reranker,
     )
 
