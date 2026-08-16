@@ -361,11 +361,12 @@ class ModelFactory:
 
         # DeepSeek
         if provider == "deepseek":
-            from langchain_deepseek import ChatDeepSeek
-            return ChatDeepSeek(
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(
                 model=model_name,
                 temperature=temperature,
                 api_key=kwargs.pop("api_key", api_keys.deepseek_api_key),
+                base_url=kwargs.pop("base_url", api_keys.deepseek_base_url),
                 **kwargs,
             )
 

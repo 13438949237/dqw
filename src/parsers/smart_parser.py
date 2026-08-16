@@ -35,6 +35,34 @@ _COMPLEX_FORMATS = frozenset({
 ALLOWED_EXTENSIONS: frozenset = _TEXT_FORMATS | _COMPLEX_FORMATS
 
 
+def filter_chunks(chunks: list, min_chars: int = 20, max_whitespace_ratio: float = 0.6) -> list:
+    """分块质量校验：过滤过短块和高噪声块。
+
+    Args:
+        chunks:       LangChain Document 列表。
+        min_chars:    最小字符数（低于此值舍弃）。
+        max_whitespace_ratio: 最大空白比例（超出视为噪声块舍弃）。
+
+    Returns:
+        过滤后的 Document 列表。
+    """
+    kept = []
+    discarded = 0
+    for c in chunks:
+        text = c.page_content
+        if len(text) < min_chars:
+            discarded += 1
+            continue
+        whitespace = sum(1 for ch in text if ch in " \t\n\r")
+        if len(text) > 0 and whitespace / len(text) > max_whitespace_ratio:
+            discarded += 1
+            continue
+        kept.append(c)
+    if discarded:
+        logger.info("分块质量校验: 保留 %d, 舍弃 %d (过短/高噪声)", len(kept), discarded)
+    return kept
+
+
 def is_supported_format(filename: str) -> bool:
     """判断文件扩展名是否在允许列表中。
 
@@ -115,7 +143,7 @@ def parse_with_mineru(file_path: str) -> ParsedDocument:
         logger.info("MinerU 不可用，直接回退传统解析: %s", path.name)
         return _fallback_parse(file_path, suffix)
 
-    # ── 尝试 MinerU 解析 ──
+    # ── MinerU 解析 ──
     try:
         from langchain_mineru.document_loaders import MinerULoader  # noqa: F811
 

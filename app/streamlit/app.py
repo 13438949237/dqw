@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Enterprise RAG — 在线检索与系统指标。"""
+"""Enterprise RAG — 在线检索"""
 from __future__ import annotations
 import sys, time
 from pathlib import Path
@@ -9,10 +9,8 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-import pandas as pd
 import streamlit as st
 
-from src.evaluation.metrics import MetricsTracker
 from src.llms.models import ModelFactory
 from src.rag_chain import RAGChain
 from src.sessions.session_manager import SessionManager
@@ -35,11 +33,6 @@ for _k, _v in _DEFAULTS.items():
 @st.cache_resource
 def _chain() -> RAGChain:
     return RAGChain()
-
-
-@st.cache_resource
-def _tracker() -> MetricsTracker:
-    return MetricsTracker()
 
 
 @st.cache_resource
@@ -153,157 +146,114 @@ with st.sidebar:
             st.error(f"清除缓存失败: {e}")
 
 # ============================================================================
-# 主区域：在线检索 | 系统指标
+# 主区域：在线检索
 # ============================================================================
+if not st.session_state.current_session_id:
+    st.info("👈 请在侧边栏新建或选择一个会话开始提问")
+else:
+    # ── 渲染历史消息 ──
+    chat_container = st.container()
+    with chat_container:
+        for m in st.session_state.session_messages:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+                if m.get("sources"):
+                    with st.expander(f"📎 引用来源 ({len(m['sources'])} 条)", expanded=False):
+                        for i, s in enumerate(m["sources"], 1):
+                            sc = s.get("score", 0)
+                            em = "🟢" if sc > 0.7 else ("🟡" if sc > 0.4 else "🔴")
+                            st.markdown(f"{em} **{i}. {s.get('source','?')}** | score={sc:.3f}")
 
-tab_chat, tab_metrics = st.tabs(["💬 在线检索", "📊 系统指标"])
+    # ── 处理挂起的问题（在 rerun 后继续流式输出）──
+    if st.session_state.generating and st.session_state.pending_question:
+        q = st.session_state.pending_question
+        sid = st.session_state.current_session_id
 
-with tab_chat:
-    if not st.session_state.current_session_id:
-        st.info("👈 请在侧边栏新建或选择一个会话开始提问")
-    else:
-        # ── 渲染历史消息 ──
-        chat_container = st.container()
         with chat_container:
-            for m in st.session_state.session_messages:
-                with st.chat_message(m["role"]):
-                    st.markdown(m["content"])
-                    if m.get("sources"):
-                        with st.expander(f"📎 引用来源 ({len(m['sources'])} 条)", expanded=False):
-                            for i, s in enumerate(m["sources"], 1):
-                                sc = s.get("score", 0)
-                                em = "🟢" if sc > 0.7 else ("🟡" if sc > 0.4 else "🔴")
-                                st.markdown(f"{em} **{i}. {s.get('source','?')}** | score={sc:.3f}")
+            with st.chat_message("assistant"):
+                status_placeholder = st.empty()
+                status_placeholder.markdown("*🔍 正在检索相关知识库...*")
+                output_placeholder = st.empty()
 
-        # ── 处理挂起的问题（在 rerun 后继续流式输出）──
-        if st.session_state.generating and st.session_state.pending_question:
-            q = st.session_state.pending_question
-            sid = st.session_state.current_session_id
+                ch = _chain()
+                ch._top_k = top_k
+                ch._use_cache = use_cache_flag
 
-            with chat_container:
-                with st.chat_message("assistant"):
-                    status_placeholder = st.empty()
-                    status_placeholder.markdown("*🔍 正在检索相关知识库...*")
-                    output_placeholder = st.empty()
+                t0 = time.perf_counter()
 
-                    ch = _chain()
-                    ch._top_k = top_k
-                    ch._use_cache = use_cache_flag
+                full_answer = ""
+                sources = []
+                error_msg = None
 
-                    tracker = _tracker()
-                    tracker.start_request(q)
-                    t0 = time.perf_counter()
+                try:
+                    for event in ch.answer_stream(q):
+                        etype = event["type"]
 
-                    full_answer = ""
-                    sources = []
-                    error_msg = None
+                        if etype == "status":
+                            status_placeholder.markdown(f"*{event['content']}*")
 
-                    try:
-                        for event in ch.answer_stream(q):
-                            etype = event["type"]
+                        elif etype == "token":
+                            if full_answer == "":
+                                status_placeholder.empty()
+                            full_answer += event["content"]
+                            output_placeholder.markdown(full_answer + "▌")
 
-                            if etype == "status":
-                                status_placeholder.markdown(f"*{event['content']}*")
+                        elif etype == "sources":
+                            sources = event["content"]
 
-                            elif etype == "token":
-                                if full_answer == "":
-                                    status_placeholder.empty()
-                                full_answer += event["content"]
-                                output_placeholder.markdown(full_answer + "▌")
+                        elif etype == "done":
+                            pass
 
-                            elif etype == "sources":
-                                sources = event["content"]
+                        elif etype == "error":
+                            error_msg = event["content"]
 
-                            elif etype == "done":
-                                pass
+                except Exception as e:
+                    error_msg = f"❌ 问答失败: {e}"
 
-                            elif etype == "error":
-                                error_msg = event["content"]
+                if error_msg:
+                    status_placeholder.empty()
+                    output_placeholder.markdown(error_msg)
+                    full_answer = error_msg
 
-                    except Exception as e:
-                        error_msg = f"❌ 问答失败: {e}"
+                else:
+                    status_placeholder.empty()
+                    output_placeholder.markdown(full_answer)
 
-                    if error_msg:
-                        status_placeholder.empty()
-                        output_placeholder.markdown(error_msg)
-                        full_answer = error_msg
+                # 显示引用来源
+                if sources:
+                    with st.expander(f"📎 引用来源 ({len(sources)} 条)", expanded=False):
+                        for i, s in enumerate(sources, 1):
+                            sc = s.get("score", 0)
+                            em = "🟢" if sc > 0.7 else ("🟡" if sc > 0.4 else "🔴")
+                            st.markdown(f"{em} **{i}. {s.get('source','?')}** | score={sc:.3f}")
 
-                    else:
-                        status_placeholder.empty()
-                        output_placeholder.markdown(full_answer)
+                # 持久化消息
+                mgr.add_message(sid, "assistant", full_answer, sources)
+                st.session_state.session_messages.append(
+                    {"role": "assistant", "content": full_answer, "sources": sources}
+                )
 
-                    # 显示引用来源
-                    if sources:
-                        with st.expander(f"📎 引用来源 ({len(sources)} 条)", expanded=False):
-                            for i, s in enumerate(sources, 1):
-                                sc = s.get("score", 0)
-                                em = "🟢" if sc > 0.7 else ("🟡" if sc > 0.4 else "🔴")
-                                st.markdown(f"{em} **{i}. {s.get('source','?')}** | score={sc:.3f}")
+                # 重置生成状态
+                st.session_state.generating = False
+                st.session_state.pending_question = None
+                st.rerun()
 
-                    # 记录指标
-                    try:
-                        from src.evaluation.metrics import calculate_tokens
-                        tracker.end_request(
-                            num_retrieved=len(sources),
-                            tokens_input=calculate_tokens(q),
-                            tokens_output=calculate_tokens(full_answer),
-                        )
-                    except Exception:
-                        pass
+    # ── 聊天输入框（生成中时禁用）──
+    is_generating = st.session_state.generating
+    if is_generating:
+        with chat_container:
+            with st.chat_message("assistant"):
+                st.markdown("*⏳ 正在思考中，请稍候...*")
 
-                    # 持久化消息
-                    mgr.add_message(sid, "assistant", full_answer, sources)
-                    st.session_state.session_messages.append(
-                        {"role": "assistant", "content": full_answer, "sources": sources}
-                    )
+    q = st.chat_input("输入问题..." if not is_generating else "正在回答中，请稍候...", disabled=is_generating)
+    if q and not is_generating:
+        sid = st.session_state.current_session_id
 
-                    # 重置生成状态
-                    st.session_state.generating = False
-                    st.session_state.pending_question = None
-                    st.rerun()
+        # 记录用户消息
+        st.session_state.session_messages.append({"role": "user", "content": q, "sources": []})
+        mgr.add_message(sid, "user", q, [])
 
-        # ── 聊天输入框（生成中时禁用）──
-        is_generating = st.session_state.generating
-        if is_generating:
-            with chat_container:
-                with st.chat_message("assistant"):
-                    st.markdown("*⏳ 正在思考中，请稍候...*")
-
-        q = st.chat_input("输入问题..." if not is_generating else "正在回答中，请稍候...", disabled=is_generating)
-        if q and not is_generating:
-            sid = st.session_state.current_session_id
-
-            # 记录用户消息
-            st.session_state.session_messages.append({"role": "user", "content": q, "sources": []})
-            mgr.add_message(sid, "user", q, [])
-
-            # 设置生成状态，禁止新输入
-            st.session_state.generating = True
-            st.session_state.pending_question = q
-            st.rerun()
-
-
-with tab_metrics:
-    st.subheader("📊 系统指标监控")
-    if st.button("🔄 刷新指标"):
+        # 设置生成状态，禁止新输入
+        st.session_state.generating = True
+        st.session_state.pending_question = q
         st.rerun()
-    t = _tracker()
-    s = t.summary(); h = t.get_history(100)
-    ca, cb, cc, cd = st.columns(4)
-    ca.metric("总请求数", s.get("total_requests", 0))
-    cb.metric("平均延迟 (s)", s.get("avg_latency") or 0)
-    cc.metric("P50 延迟 (s)", s.get("p50_latency") or 0)
-    cd.metric("P99 延迟 (s)", s.get("p99_latency") or 0)
-    if h:
-        st.divider()
-        st.subheader("📈 延迟趋势")
-        st.line_chart([x.get("latency_seconds", 0) for x in h], height=200)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("📈 Token 用量")
-            st.line_chart(pd.DataFrame({"输入Token": [x.get("tokens_input", 0) for x in h], "输出Token": [x.get("tokens_output", 0) for x in h]}), height=200)
-        with c2:
-            st.subheader("📈 召回率 / 精确率")
-            st.line_chart(pd.DataFrame({"召回率": [x.get("recall") or 0 for x in h], "精确率": [x.get("precision") or 0 for x in h]}), height=200)
-    else:
-        st.info("暂无请求历史，开始提问后将在此展示指标")

@@ -38,8 +38,23 @@ qdrant:
 
 # --- Document Processing ---
 document:
-  chunk_size: 512
-  chunk_overlap: 50
+  # 默认分块参数（未在 per_type 中配置的格式使用）
+  default_chunk_size: 512
+  default_chunk_overlap: 50
+  # 按文件类型独立配置分块参数
+  per_type:
+    md:    { chunk_size: 512, chunk_overlap: 64 }
+    txt:   { chunk_size: 512, chunk_overlap: 50 }
+    pdf:   { chunk_size: 800, chunk_overlap: 80 }
+    docx:  { chunk_size: 600, chunk_overlap: 60 }
+    pptx:  { chunk_size: 400, chunk_overlap: 40 }
+    xlsx:  { chunk_size: 300, chunk_overlap: 30 }
+    xls:   { chunk_size: 300, chunk_overlap: 30 }
+    png:   { chunk_size: 500, chunk_overlap: 50 }
+    jpg:   { chunk_size: 500, chunk_overlap: 50 }
+    jpeg:  { chunk_size: 500, chunk_overlap: 50 }
+    bmp:   { chunk_size: 500, chunk_overlap: 50 }
+    tiff:  { chunk_size: 500, chunk_overlap: 50 }
   supported_formats:
     - "pdf"
     - "docx"

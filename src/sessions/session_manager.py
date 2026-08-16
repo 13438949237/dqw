@@ -38,6 +38,16 @@ class SessionManager:
         return self._engine
 
     def _ensure_tables(self) -> None:
+        """创建会话表和消息表（幂等），连接失败时只记日志不抛异常。"""
+        try:
+            with self._engine.connect() as conn:  # type: ignore[union-attr]
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS sessions (...)
+                """))
+                ...
+                conn.commit()
+        except Exception as exc:
+            logger.warning("PostgreSQL 建表失败（服务未启动？）: %s", exc)
         with self._engine.connect() as conn:  # type: ignore[union-attr]
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS sessions (

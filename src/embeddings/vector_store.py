@@ -10,7 +10,10 @@ Qdrant 混合向量存储。
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 import re
 import uuid
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
@@ -250,17 +253,21 @@ class QdrantVectorStore:
     # ── 添加文档 ───────────────────────────────────────────────────────
 
     def add_documents(
-        self,
-        documents: List[Document],
-        batch_size: int = 32,
-        generate_sentences: bool = True,
+            self,
+            documents: List[Document],
+            batch_size: int = 32,
+            generate_sentences: bool = True,
+            dedup: bool = True,
+            max_workers: int = 4,
     ) -> List[str]:
-        """批量入库文档，自动生成全部四种向量。
+        """批量入库文档（批量 Embedding + SHA256 去重 + 多线程构建 points）。
 
         Args:
             documents:          LangChain Document 列表。
             batch_size:         嵌入生成 / Qdrant upsert 批次大小。
             generate_sentences: 是否生成句子级向量（耗时操作）。
+            dedup:              是否启用 SHA256 去重。
+            max_workers:        构建 points 的并行线程数。
 
         Returns:
             所有入库 point 的 ID 列表。
@@ -272,39 +279,75 @@ class QdrantVectorStore:
         texts = [doc.page_content for doc in documents]
         self._sparse_encoder.fit(texts)
 
-        # 2. 逐文档生成向量与 point
-        points: List[PointStruct] = []
-        sentence_points: List[PointStruct] = []
+        # ── SHA256 去重 ──
+        if dedup:
+            existing_hashes: set = set()
+            try:
+                recs, _ = self._client.scroll(
+                    collection_name=self._chunk_collection, limit=10000,
+                    with_payload=True, with_vectors=False,
+                )
+                for r in recs:
+                    h = (r.payload or {}).get("sha256", "")
+                    if h:
+                        existing_hashes.add(h)
+            except Exception:
+                pass
+            unique_docs = []
+            skipped = 0
+            for doc in documents:
+                h = self._sha256(doc.page_content)
+                if h in existing_hashes:
+                    skipped += 1
+                    continue
+                existing_hashes.add(h)
+                doc.metadata["sha256"] = h
+                unique_docs.append(doc)
+            if skipped:
+                logger.info("SHA256 去重: 跳过 %d 个重复 chunk", skipped)
+            documents = unique_docs
 
-        for idx, doc in enumerate(documents):
-            point_id = str(uuid.uuid4())
+        if not documents:
+            return []
+
+        # ── 批量生成 dense 向量 ──
+        all_dense_vecs: List[List[float]] = []
+        texts_after_dedup = [doc.page_content for doc in documents]
+        for i in range(0, len(texts_after_dedup), batch_size):
+            batch_texts = texts_after_dedup[i: i + batch_size]
+            all_dense_vecs.extend(self._get_dense_vectors_batch(batch_texts))
+
+        # ── 多线程构建 chunk points ──
+        _lock = Lock()
+        points: list = [None] * len(documents)
+        sentence_points: list = []
+        _sent_lock = Lock()
+
+        def _build_one(idx: int) -> None:
+            doc = documents[idx]
             text = doc.page_content
+            point_id = str(uuid.uuid4())
+            dense_vec = all_dense_vecs[idx]
 
-            # ── dense 向量 ──
-            dense_vec = self._get_dense_vector(text)
-
-            # ── sparse 向量 ──
             sparse_indices, sparse_values = self._sparse_encoder.encode(text)
 
-            # ── 摘要向量（长文本时） ──
             summary_text = ""
             if self._is_long(text):
                 summary_text = self._generate_summary(text)
-                # 如果成功生成摘要，用摘要向量替代原 dense 向量
                 if summary_text:
                     dense_vec = self._get_dense_vector(summary_text)
 
-            # ── 构建 payload ──
             payload = {
                 **{k: v for k, v in doc.metadata.items()},
                 "text": text,
                 "has_summary": bool(summary_text),
                 "summary_text": summary_text if summary_text else "",
                 "char_count": len(text),
+                "sha256": doc.metadata.get("sha256", self._sha256(text)),
             }
 
-            points.append(
-                PointStruct(
+            with _lock:
+                points[idx] = PointStruct(
                     id=point_id,
                     vector={
                         "dense": dense_vec,
@@ -315,17 +358,27 @@ class QdrantVectorStore:
                     },
                     payload=payload,
                 )
-            )
 
-            # ── 句子向量 ──
             if generate_sentences and text.strip():
                 sps = self._build_sentence_points(point_id, text, doc.metadata)
-                sentence_points.extend(sps)
+                if sps:
+                    with _sent_lock:
+                        sentence_points.extend(sps)
 
-            if (idx + 1) % 20 == 0:
-                logger.info("向量生成进度: %d/%d", idx + 1, len(documents))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_build_one, i): i for i in range(len(documents))}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    logger.warning("构建 point 失败: %s", exc)
 
-        # 3. 批量写入 Qdrant
+        points = [p for p in points if p is not None]
+
+        if (len(documents)) % 20 == 0:
+            logger.info("向量生成进度: %d/%d", len(points), len(documents))
+
+        # ── 批量写入 Qdrant ──
         all_ids: List[str] = []
         for i in range(0, len(points), batch_size):
             batch = points[i: i + batch_size]
@@ -531,6 +584,16 @@ class QdrantVectorStore:
 
     # ── 辅助方法 ───────────────────────────────────────────────────────
 
+    
+    def _get_dense_vectors_batch(self, texts: list) -> list:
+        """批量生成 dense 向量，减少 API 调用次数。"""
+        results = self.embedding.embed_documents(texts)
+        return [r.tolist() if hasattr(r, "tolist") else r for r in results]
+
+    @staticmethod
+    def _sha256(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     def _get_dense_vector(self, text: str) -> List[float]:
         result = self.embedding.embed_query(text)
         if isinstance(result, np.ndarray):
@@ -545,7 +608,7 @@ class QdrantVectorStore:
     def _generate_summary(self, text: str) -> str:
         """调用 LLM 生成单句摘要。"""
         prompt = (
-            "请用一句话总结以下文本的核心内容，不超过 80 个字。"
+            "请用一句话总结以下文本的核心内容，不超过 100 个字。"
             "只输出摘要内容，不要任何前缀：\n\n"
             + text[:4000]  # 截断保护
         )

@@ -64,6 +64,7 @@ class AskResponse(BaseModel):
     cached: bool
     model: Optional[str] = None
     latency_seconds: Optional[float] = None
+    evaluation: Optional[Dict[str, Any]] = None
 
 class RetrieveRequest(BaseModel):
     query: str = Field(..., min_length=1)
@@ -149,6 +150,7 @@ async def ask_question(req: AskRequest):
         cached=result.get("cached", False),
         model=result.get("model"),
         latency_seconds=result.get("latency_seconds"),
+        evaluation=result.get("evaluation"),
     )
 
 @app.post("/retrieve", response_model=RetrieveResponse)

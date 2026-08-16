@@ -84,11 +84,30 @@ class QdrantConfig(BaseModel):
 
 class DocumentConfig(BaseModel):
     """文档处理参数。"""
-    chunk_size: int = 512
-    chunk_overlap: int = 50
+    default_chunk_size: int = 512
+    default_chunk_overlap: int = 50
+    per_type: dict = Field(default_factory=lambda: {
+        "md":   {"chunk_size": 512, "chunk_overlap": 64},
+        "txt":  {"chunk_size": 512, "chunk_overlap": 50},
+        "pdf":  {"chunk_size": 800, "chunk_overlap": 80},
+        "docx": {"chunk_size": 600, "chunk_overlap": 60},
+        "pptx": {"chunk_size": 400, "chunk_overlap": 40},
+        "xlsx": {"chunk_size": 300, "chunk_overlap": 30},
+        "xls":  {"chunk_size": 300, "chunk_overlap": 30},
+        "png":  {"chunk_size": 500, "chunk_overlap": 50},
+        "jpg":  {"chunk_size": 500, "chunk_overlap": 50},
+        "jpeg": {"chunk_size": 500, "chunk_overlap": 50},
+        "bmp":  {"chunk_size": 500, "chunk_overlap": 50},
+        "tiff": {"chunk_size": 500, "chunk_overlap": 50},
+    })
     supported_formats: list[str] = Field(
-        default_factory=lambda: ["md", "txt", "pdf", "png", "jpg", "jpeg", "bmp", "tiff", "docx", "pptx", "xlsx", "xls", "html", "csv"]
+        default_factory=lambda: ["md","txt","pdf","png","jpg","jpeg","bmp","tiff","docx","pptx","xlsx","xls","html","csv"]
     )
+
+    def get_chunk_params(self, suffix: str) -> tuple:
+        """根据文件后缀返回 (chunk_size, chunk_overlap)。"""
+        pt = self.per_type.get(suffix.lstrip("."), {})
+        return pt.get("chunk_size", self.default_chunk_size), pt.get("chunk_overlap", self.default_chunk_overlap)
 
 
 class RetrievalConfig(BaseModel):
@@ -153,6 +172,10 @@ class ApiKeysConfig(BaseModel):
     # DeepSeek（兼容 OpenAI 协议）
     deepseek_api_key: Optional[str] = Field(default=None)
     deepseek_base_url: Optional[str] = Field(default="https://api.deepseek.com")
+    # Langfuse
+    langfuse_secret_key: Optional[str] = Field(default=None)
+    langfuse_public_key: Optional[str] = Field(default=None)
+    langfuse_base_url: Optional[str] = Field(default="https://us.cloud.langfuse.com")
     # Cohere / Jina（重排序 API）
     cohere_api_key: Optional[str] = Field(default=None)
     jina_api_key: Optional[str] = Field(default=None)

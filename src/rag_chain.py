@@ -35,6 +35,16 @@ from src.utils.config import get_config
 
 logger = logging.getLogger(__name__)
 
+_monitor_pipeline = None
+
+
+def _get_monitor():
+    global _monitor_pipeline
+    if _monitor_pipeline is None:
+        from src.evaluation.monitor import MonitorPipeline
+        _monitor_pipeline = MonitorPipeline()
+    return _monitor_pipeline
+
 # ── 默认 Prompt 模板 ──────────────────────────────────────────────────────
 # DEFAULT_RAG_PROMPT = (
 #     "你是一个专业的知识库问答助手。请严格基于以下检索到的文档内容回答问题。\n"
@@ -200,6 +210,25 @@ class RAGChain:
                 pass
 
         yield {"type": "sources", "content": source_metadata}
+
+        # ── 6. MonitorPipeline 评估（流式）──
+        try:
+            from src.evaluation.metrics import calculate_tokens
+            contexts_text = [doc.page_content for doc in retrieved_docs] if retrieved_docs else []
+            eval_result = _get_monitor().evaluate(
+                query=question,
+                answer=full_text,
+                contexts=contexts_text,
+                model=getattr(self._llm, '_provider', '') + '/' + getattr(self._llm, '_model_name',
+                                                                          '') if self._llm else "",
+                input_tokens=calculate_tokens(question + context),
+                output_tokens=calculate_tokens(full_text),
+                latency=0.0,
+            )
+            logger.info("流式评估完成: cost=%.6f", eval_result.get("cost_usd", 0))
+        except Exception as exc:
+            logger.warning("MonitorPipeline 流式评估失败(不影响主流程): %s", exc)
+
         yield {"type": "done", "content": full_text}
 
     def answer(self, question: str) -> Dict[str, Any]:
@@ -282,7 +311,26 @@ class RAGChain:
             "latency_seconds": llm_result.get("latency_seconds", 0),
         }
 
-        # ── 6. 写入缓存 ──────────────────────────────────────────────
+        # ── 6. MonitorPipeline 评估（成本 + Ragas + Langfuse 追踪）──
+        try:
+            usage = llm_result.get("usage", {})
+            contexts_text = [doc.page_content for doc in retrieved_docs]
+            eval_result = _get_monitor().evaluate(
+                query=question,
+                answer=answer_text,
+                contexts=contexts_text,
+                model=result["model"],
+                input_tokens=usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0),
+                output_tokens=usage.get("completion_tokens", 0) or usage.get("output_tokens", 0),
+                latency=result["latency_seconds"],
+            )
+            result["evaluation"] = eval_result
+            logger.info("评估完成: cost=%.6f, ragas=%s", eval_result.get("cost_usd", 0),
+                         eval_result.get("ragas_scores", {}))
+        except Exception as exc:
+            logger.warning("MonitorPipeline 评估失败(不影响主流程): %s", exc)
+
+        # ── 7. 写入缓存 ──────────────────────────────────────────────
         if self._use_cache:
             try:
                 cache_entry = {
