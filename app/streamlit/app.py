@@ -9,6 +9,14 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# ── 修复 torch 加载大模型时与 pyarrow(arrow.dll) 的内存冲突 ──
+# arrow.dll 崩溃(0xc0000005) 源于 pyarrow jemalloc 内存池与 torch 分配器
+# 在多线程 Streamlit 环境下的冲突，必须在导入 torch/pyarrow 前设置。
+import os
+os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import streamlit as st
 
 from src.llms.models import ModelFactory
@@ -24,6 +32,8 @@ _DEFAULTS = {
     "session_messages": [],
     "generating": False,
     "pending_question": None,
+    "pending_regenerate": False,
+    "user_id": "streamlit_user",
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -121,6 +131,8 @@ with st.sidebar:
 
     st.divider()
     st.header("🔍 检索参数")
+    user_id = st.text_input("用户标识", value=st.session_state.user_id)
+    st.session_state.user_id = user_id.strip() or "streamlit_user"
     top_k = st.slider("Top-K 结果数", 1, 20, 5)
     use_cache_flag = st.checkbox("启用缓存", value=True)
 
@@ -154,7 +166,7 @@ else:
     # ── 渲染历史消息 ──
     chat_container = st.container()
     with chat_container:
-        for m in st.session_state.session_messages:
+        for idx, m in enumerate(st.session_state.session_messages):
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
                 if m.get("sources"):
@@ -163,6 +175,23 @@ else:
                             sc = s.get("score", 0)
                             em = "🟢" if sc > 0.7 else ("🟡" if sc > 0.4 else "🔴")
                             st.markdown(f"{em} **{i}. {s.get('source','?')}** | score={sc:.3f}")
+                if m["role"] == "assistant" and m.get("cached"):
+                    if st.button("🔄 重新生成", key=f"regen_{idx}"):
+                        last_user = next(
+                            (
+                                item["content"]
+                                for item in reversed(
+                                    st.session_state.session_messages[:idx + 1]
+                                )
+                                if item["role"] == "user"
+                            ),
+                            None,
+                        )
+                        if last_user:
+                            st.session_state.generating = True
+                            st.session_state.pending_question = last_user
+                            st.session_state.pending_regenerate = True
+                            st.rerun()
 
     # ── 处理挂起的问题（在 rerun 后继续流式输出）──
     if st.session_state.generating and st.session_state.pending_question:
@@ -184,13 +213,25 @@ else:
                 full_answer = ""
                 sources = []
                 error_msg = None
+                was_cached = False
+
+                # 多轮历史：排除当前问题自身
+                history = st.session_state.session_messages[:-1] if len(st.session_state.session_messages) > 1 else []
 
                 try:
-                    for event in ch.answer_stream(q):
+                    for event in ch.answer_stream(
+                        q,
+                        history=history,
+                        user_id=st.session_state.user_id,
+                        regenerate=st.session_state.pending_regenerate,
+                    ):
                         etype = event["type"]
 
                         if etype == "status":
                             status_placeholder.markdown(f"*{event['content']}*")
+
+                        elif etype == "cached":
+                            was_cached = bool(event["content"])
 
                         elif etype == "token":
                             if full_answer == "":
@@ -230,12 +271,18 @@ else:
                 # 持久化消息
                 mgr.add_message(sid, "assistant", full_answer, sources)
                 st.session_state.session_messages.append(
-                    {"role": "assistant", "content": full_answer, "sources": sources}
+                    {
+                        "role": "assistant",
+                        "content": full_answer,
+                        "sources": sources,
+                        "cached": was_cached,
+                    }
                 )
 
                 # 重置生成状态
                 st.session_state.generating = False
                 st.session_state.pending_question = None
+                st.session_state.pending_regenerate = False
                 st.rerun()
 
     # ── 聊天输入框（生成中时禁用）──
@@ -256,4 +303,5 @@ else:
         # 设置生成状态，禁止新输入
         st.session_state.generating = True
         st.session_state.pending_question = q
+        st.session_state.pending_regenerate = False
         st.rerun()

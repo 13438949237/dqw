@@ -10,8 +10,11 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from src.utils.config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,18 @@ _COMPLEX_FORMATS = frozenset({
 
 # 全部允许的扩展名
 ALLOWED_EXTENSIONS: frozenset = _TEXT_FORMATS | _COMPLEX_FORMATS
+
+
+def _is_large_excel(file_path: str, suffix: str) -> bool:
+    """Check whether an Excel file should bypass MinerU."""
+    if suffix not in (".xlsx", ".xls"):
+        return False
+    max_mb = get_config().document.excel_mineru_max_mb
+    try:
+        size = Path(file_path).stat().st_size
+    except OSError:
+        return False
+    return size > max_mb * 1024 * 1024
 
 
 def filter_chunks(chunks: list, min_chars: int = 20, max_whitespace_ratio: float = 0.6) -> list:
@@ -147,30 +162,29 @@ def parse_with_mineru(file_path: str) -> ParsedDocument:
     try:
         from langchain_mineru.document_loaders import MinerULoader  # noqa: F811
 
-        logger.info("使用 MinerU flash 模式解析: %s", path.name)
-        loader = MinerULoader(source=str(path), mode="flash")
+        split_pages = suffix in (".pdf", ".docx")
+        logger.info(
+            "使用 MinerU flash 模式解析: %s (split_pages=%s)",
+            path.name,
+            split_pages,
+        )
+        loader = MinerULoader(
+            source=str(path),
+            mode="flash",
+            split_pages=split_pages,
+        )
         docs = loader.load()
 
         blocks: List[ParsedBlock] = []
+        max_page = 1
         for doc in docs:
             text = doc.page_content
             if not text.strip():
                 continue
             page = doc.metadata.get("page_number", doc.metadata.get("page", 1))
             page_num = int(page) if page else 1
-
-            paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-            if not paragraphs:
-                paragraphs = [text.strip()]
-
-            for para in paragraphs:
-                blocks.append(
-                    ParsedBlock(
-                        block_type="paragraph",
-                        content=para,
-                        page=page_num,
-                    )
-                )
+            max_page = max(max_page, page_num)
+            blocks.extend(_parse_mineru_markdown(text, page_num))
 
         if not blocks:
             logger.warning("MinerU 未提取到文本内容: %s", path.name)
@@ -188,6 +202,8 @@ def parse_with_mineru(file_path: str) -> ParsedDocument:
             source=path.name,
             file_type=suffix.lstrip("."),
             blocks=blocks,
+            total_pages=max_page,
+            extra={"mineru_mode": "flash", "split_pages": split_pages},
         )
 
     except ImportError:
@@ -245,6 +261,200 @@ class ParsedDocument:
     blocks: List[ParsedBlock] = field(default_factory=list)
     total_pages: int = 1
     extra: Dict[str, Any] = field(default_factory=dict)
+
+
+def _is_markdown_table_separator(line: str) -> bool:
+    """Return True for Markdown table delimiter rows such as | --- | --- |."""
+    if "|" not in line:
+        return False
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    return bool(cells) and all(
+        re.fullmatch(r":?-{3,}:?", cell) for cell in cells
+    )
+
+
+def _format_markdown_table_row(line: str) -> str:
+    """Normalize a Markdown table row to the same format used by pdfplumber."""
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    return " | ".join(cells)
+
+
+class _HTMLTableParser(HTMLParser):
+    """Extract cell text from an HTML table fragment."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: List[List[str]] = []
+        self._current_row: List[str] = []
+        self._current_cell: Optional[List[str]] = None
+
+    def handle_starttag(self, tag: str, attrs: List[tuple]) -> None:
+        if tag in ("td", "th"):
+            self._current_cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("td", "th") and self._current_cell is not None:
+            self._current_row.append("".join(self._current_cell).strip())
+            self._current_cell = None
+        elif tag == "tr":
+            if self._current_row:
+                self.rows.append(self._current_row)
+            self._current_row = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_cell is not None:
+            self._current_cell.append(data)
+
+
+def _extract_html_table_rows(html: str) -> List[List[str]]:
+    """Convert an HTML table fragment into rows of cell text."""
+    parser = _HTMLTableParser()
+    parser.feed(html)
+    parser.close()
+    return parser.rows
+
+
+def _parse_mineru_markdown(markdown: str, page: int) -> List[ParsedBlock]:
+    """Convert one MinerU page result into typed ParsedBlock instances.
+
+    MinerU returns Markdown, but the previous implementation discarded that
+    structure by splitting on blank lines and marking everything as a
+    paragraph. This parser keeps headings, Markdown/HTML tables, lists, and
+    page numbers so SemanticChunker can use them as natural chunk boundaries.
+    """
+    blocks: List[ParsedBlock] = []
+    paragraph_buffer: List[str] = []
+    table_buffer: List[str] = []
+    html_table_buffer: List[str] = []
+    list_buffer: List[str] = []
+    in_code_block = False
+    in_html_table = False
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph_buffer
+        text = "\n".join(line.rstrip() for line in paragraph_buffer).strip()
+        paragraph_buffer = []
+        if text:
+            blocks.append(
+                ParsedBlock(block_type="paragraph", content=text, page=page)
+            )
+
+    def flush_table() -> None:
+        nonlocal table_buffer
+        if table_buffer:
+            rows = [
+                _format_markdown_table_row(row)
+                for row in table_buffer
+                if not _is_markdown_table_separator(row)
+            ]
+            table_buffer = []
+            if rows:
+                blocks.append(
+                    ParsedBlock(
+                        block_type="table",
+                        content="\n".join(rows),
+                        page=page,
+                    )
+                )
+
+    def flush_list() -> None:
+        nonlocal list_buffer
+        if list_buffer:
+            blocks.append(
+                ParsedBlock(
+                    block_type="list_item",
+                    content="\n".join(line.strip() for line in list_buffer),
+                    page=page,
+                )
+            )
+            list_buffer = []
+
+    def flush_html_table() -> None:
+        nonlocal html_table_buffer, in_html_table
+        if html_table_buffer:
+            rows = _extract_html_table_rows("\n".join(html_table_buffer))
+            html_table_buffer = []
+            if rows:
+                blocks.append(
+                    ParsedBlock(
+                        block_type="table",
+                        content="\n".join(" | ".join(row) for row in rows),
+                        page=page,
+                    )
+                )
+        in_html_table = False
+
+    def flush_all() -> None:
+        flush_paragraph()
+        flush_table()
+        flush_list()
+        flush_html_table()
+
+    for raw_line in markdown.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            flush_all()
+            in_code_block = not in_code_block
+            continue
+
+        if in_code_block:
+            paragraph_buffer.append(raw_line)
+            continue
+
+        if in_html_table:
+            html_table_buffer.append(line)
+            if "</table>" in stripped.lower():
+                flush_html_table()
+            continue
+
+        if not stripped:
+            flush_all()
+            continue
+
+        if stripped.lower().startswith("<table"):
+            flush_paragraph()
+            flush_table()
+            flush_list()
+            html_table_buffer.append(line)
+            if "</table>" in stripped.lower():
+                flush_html_table()
+            else:
+                in_html_table = True
+            continue
+
+        heading = re.match(r"^(#{1,6})\s+(.+)", stripped)
+        if heading:
+            flush_all()
+            blocks.append(
+                ParsedBlock(
+                    block_type="heading",
+                    content=heading.group(2).strip(),
+                    heading_level=len(heading.group(1)),
+                    page=page,
+                )
+            )
+            continue
+
+        if stripped.startswith("|") and "|" in stripped[1:]:
+            flush_paragraph()
+            flush_list()
+            table_buffer.append(line)
+            continue
+
+        if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", stripped):
+            flush_paragraph()
+            flush_table()
+            list_buffer.append(line)
+            continue
+
+        flush_table()
+        flush_list()
+        paragraph_buffer.append(line)
+
+    flush_all()
+    return blocks
 
 
 # ============================================================================
@@ -452,50 +662,25 @@ def parse_markdown(file_path: str) -> ParsedDocument:
     return doc
 
 
-def parse_xlsx(file_path: str) -> ParsedDocument:
-    """使用 openpyxl 解析 Excel 表格，每行作为一个块。
-
-    如 unstructured 可用，优先使用 unstructured 以获取更好的表格语义理解。
-    """
-    path = Path(file_path)
-    blocks: List[ParsedBlock] = []
-
-    # 优先尝试 unstructured
+def _parse_xlsx_with_openpyxl(file_path: str) -> List[ParsedBlock]:
+    """Parse an Excel workbook sheet by sheet with read-only openpyxl."""
     try:
-        from unstructured.partition.xlsx import partition_xlsx
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise ImportError(
+            "XLSX 解析需要安装 openpyxl 或 unstructured"
+        ) from exc
 
-        elements = partition_xlsx(filename=file_path)
-        for el in elements:
-            el_type = str(type(el).__name__).lower()
-            if "table" in el_type:
-                block_type = "table"
-            elif "title" in el_type or "header" in el_type:
-                block_type = "heading"
-            else:
-                block_type = "paragraph"
-            blocks.append(
-                ParsedBlock(block_type=block_type, content=str(el))
-            )
-        logger.info("XLSX 解析完成 (unstructured): %s", path.name)
-    except ImportError:
-        logger.debug("unstructured 不可用，回退到 openpyxl")
-        try:
-            from openpyxl import load_workbook
-        except ImportError as exc:
-            raise ImportError(
-                "XLSX 解析需要安装 openpyxl 或 unstructured"
-            ) from exc
-
-        wb = load_workbook(file_path, read_only=True, data_only=True)
+    blocks: List[ParsedBlock] = []
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    try:
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
-            rows = list(ws.iter_rows(values_only=True))
-            if not rows:
-                continue
-
-            # 第一行作为表头
-            header = [str(c or "") for c in rows[0]]
-            for row_idx, row in enumerate(rows[1:], start=2):
+            header: List[str] = []
+            for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                if row_idx == 1:
+                    header = [str(c or "") for c in row]
+                    continue
                 line = " | ".join(
                     f"{header[i]}: {val}"
                     for i, val in enumerate(row)
@@ -509,19 +694,59 @@ def parse_xlsx(file_path: str) -> ParsedDocument:
                             extra={"sheet": sheet_name, "row": row_idx},
                         )
                     )
+    finally:
         wb.close()
-        logger.info("XLSX 解析完成 (openpyxl): %s", path.name)
-    except Exception:
-        logger.exception("XLSX 解析失败: %s", path.name)
-        raise
+    return blocks
 
-    doc = ParsedDocument(
-        doc_id=f"xlsx:{path.stem}",
+
+def parse_xlsx(
+    file_path: str,
+    prefer_openpyxl: bool = False,
+) -> ParsedDocument:
+    """Parse an Excel workbook as structured table blocks.
+
+    Unstructured is preferred for small files because it can preserve richer
+    table semantics. Large files can use prefer_openpyxl=True to stream rows
+    per sheet without building one huge workbook Markdown document.
+    """
+    path = Path(file_path)
+    blocks: List[ParsedBlock] = []
+    backend = "openpyxl" if prefer_openpyxl else "unstructured"
+
+    if prefer_openpyxl:
+        blocks = _parse_xlsx_with_openpyxl(file_path)
+        logger.info("XLSX 解析完成 (openpyxl): %s", path.name)
+    else:
+        try:
+            from unstructured.partition.xlsx import partition_xlsx
+
+            elements = partition_xlsx(filename=file_path)
+            for el in elements:
+                el_type = str(type(el).__name__).lower()
+                if "table" in el_type:
+                    block_type = "table"
+                elif "title" in el_type or "header" in el_type:
+                    block_type = "heading"
+                else:
+                    block_type = "paragraph"
+                blocks.append(
+                    ParsedBlock(block_type=block_type, content=str(el))
+                )
+            logger.info("XLSX 解析完成 (unstructured): %s", path.name)
+        except ImportError:
+            logger.debug("unstructured 不可用，回退到 openpyxl")
+            backend = "openpyxl"
+            blocks = _parse_xlsx_with_openpyxl(file_path)
+            logger.info("XLSX 解析完成 (openpyxl): %s", path.name)
+
+    file_type = path.suffix.lower().lstrip(".")
+    return ParsedDocument(
+        doc_id=f"{file_type}:{path.stem}",
         source=path.name,
-        file_type="xlsx",
+        file_type=file_type,
         blocks=blocks,
+        extra={"parser_backend": backend},
     )
-    return doc
 
 
 def parse_text(file_path: str) -> ParsedDocument:
@@ -585,6 +810,16 @@ def parse_file(file_path: str) -> ParsedDocument:
         raise ValueError(
             f"不支持该文件类型 (.{suffix})，请选择规定类型的文件。"
             f"允许的格式: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+
+    if _is_large_excel(file_path, suffix):
+        logger.info(
+            "Excel 文件超过 MinerU 大小阈值，改用本地逐 Sheet 解析: %s",
+            Path(file_path).name,
+        )
+        return parse_xlsx(
+            file_path,
+            prefer_openpyxl=suffix == ".xlsx",
         )
 
     parser = _PARSER_REGISTRY.get(suffix)

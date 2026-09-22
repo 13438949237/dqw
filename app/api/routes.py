@@ -16,6 +16,7 @@ from src.llms.models import ModelFactory
 from src.parsers.pipeline import load_and_chunk
 from src.rag_chain import RAGChain
 from src.retrievers.pipeline import retrieve as pipeline_retrieve
+from src.sessions.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,9 @@ class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: Optional[int] = Field(None, ge=1, le=100)
     use_cache: bool = Field(True)
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
+    regenerate: bool = False
 
 class AskResponse(BaseModel):
     question: str
@@ -133,14 +137,46 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/ask", response_model=AskResponse)
 async def ask_question(req: AskRequest):
+    """RAG 问答端点：多轮会话上下文。"""
     tracker = MetricsTracker()
     tracker.start_request(req.question)
+
     try:
+        # 加载会话历史（多轮上下文）
+        history = []
+        if req.session_id:
+            try:
+                history = SessionManager().get_messages(req.session_id, limit=20)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "加载会话历史失败（忽略历史继续单轮问答）: %s", exc
+                )
+
         chain = RAGChain(top_k=req.top_k, use_cache=req.use_cache)
-        result = chain.answer(req.question)
+        result = chain.answer(
+            req.question,
+            history=history,
+            user_id=req.user_id,
+            regenerate=req.regenerate,
+        )
+
+        # 保存本轮消息到会话
+        if req.session_id:
+            try:
+                SessionManager().add_message(req.session_id, "user", req.question, [])
+                SessionManager().add_message(
+                    req.session_id,
+                    "assistant",
+                    result.get("answer", ""),
+                    result.get("source_metadata", []),
+                )
+            except Exception:
+                pass
     except Exception as exc:
-        import logging; logging.getLogger(__name__).exception("RAG chain failed")
-        raise HTTPException(status_code=500, detail="RAG processing failed: "+str(exc))
+        tracker.end_request()
+        raise
+
     num_retrieved = len(result.get("retrieved_docs", []))
     tracker.end_request(num_retrieved=num_retrieved)
     return AskResponse(
@@ -164,6 +200,36 @@ async def retrieve_docs(req: RetrieveRequest):
     for doc in docs:
         results.append({"content": doc.page_content, "source": doc.metadata.get("source", "unknown"), "page": doc.metadata.get("page", 1), "section_title": doc.metadata.get("section_title", ""), "score": doc.metadata.get("rerank_score", doc.metadata.get("qdrant_score", 0)), "file_type": doc.metadata.get("file_type", "")})
     return RetrieveResponse(query=req.query, results=results, count=len(results))
+
+
+@app.post("/sessions")
+async def create_session(name: str = ""):
+    """创建会话，返回 session_id。"""
+    try:
+        sid = SessionManager().create_session(name)
+        return {"session_id": sid}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"创建会话失败: {exc}")
+
+
+@app.get("/sessions")
+async def list_sessions():
+    """列出全部会话。"""
+    try:
+        return {"sessions": SessionManager().list_sessions()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"查询会话失败: {exc}")
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """删除指定会话及其消息。"""
+    try:
+        ok = SessionManager().delete_session(session_id)
+        return {"status": "deleted" if ok else "not_found", "session_id": session_id}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"删除会话失败: {exc}")
+
 
 @app.get("/documents", response_model=List[DocumentInfo])
 async def list_documents():

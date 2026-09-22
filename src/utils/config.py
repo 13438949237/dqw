@@ -86,6 +86,11 @@ class DocumentConfig(BaseModel):
     """文档处理参数。"""
     default_chunk_size: int = 512
     default_chunk_overlap: int = 50
+    excel_mineru_max_mb: int = Field(
+        default=20,
+        ge=1,
+        description="Excel 文件超过该大小后不再使用 MinerU，改用逐 Sheet 解析",
+    )
     per_type: dict = Field(default_factory=lambda: {
         "md":   {"chunk_size": 512, "chunk_overlap": 64},
         "txt":  {"chunk_size": 512, "chunk_overlap": 50},
@@ -125,7 +130,7 @@ class CacheConfig(BaseModel):
     backend: str = "redis"
     redis_host: str = "localhost"
     redis_port: int = 6379
-    ttl_seconds: int = 3600
+    ttl_seconds: int = 86400
     semantic_enabled: bool = True
     similarity_threshold: float = 0.92
     vec_dim: int = 1024
@@ -160,6 +165,13 @@ class PostgresConfig(BaseModel):
     user: str = "rag_user"
     password: str = "rag_password"
     database: str = "rag_sessions"
+
+
+class SessionContextConfig(BaseModel):
+    """会话上下文管理配置。"""
+    max_history_messages: int = 20
+    max_context_tokens: int = 3000
+    summary_enabled: bool = True
 
 
 class ApiKeysConfig(BaseModel):
@@ -207,6 +219,7 @@ class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     streamlit: StreamlitConfig = Field(default_factory=StreamlitConfig)
     postgresql: PostgresConfig = Field(default_factory=PostgresConfig)
+    session_context: SessionContextConfig = Field(default_factory=SessionContextConfig)
     api_keys: ApiKeysConfig = Field(default_factory=ApiKeysConfig)
 
 

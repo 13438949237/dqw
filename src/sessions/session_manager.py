@@ -42,33 +42,27 @@ class SessionManager:
         try:
             with self._engine.connect() as conn:  # type: ignore[union-attr]
                 conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS sessions (...)
-                """))
-                ...
+                                CREATE TABLE IF NOT EXISTS sessions (
+                                    id VARCHAR(36) PRIMARY KEY,
+                                    name VARCHAR(200) NOT NULL DEFAULT '',
+                                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                                    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                                )
+                            """))
+                conn.execute(text("""
+                                CREATE TABLE IF NOT EXISTS messages (
+                                    id VARCHAR(36) PRIMARY KEY,
+                                    session_id VARCHAR(36) NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                                    role VARCHAR(20) NOT NULL,
+                                    content TEXT NOT NULL DEFAULT '',
+                                    sources JSONB DEFAULT '[]'::jsonb,
+                                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                                )
+                            """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id, created_at)"))
                 conn.commit()
         except Exception as exc:
             logger.warning("PostgreSQL 建表失败（服务未启动？）: %s", exc)
-        with self._engine.connect() as conn:  # type: ignore[union-attr]
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id VARCHAR(36) PRIMARY KEY,
-                    name VARCHAR(200) NOT NULL DEFAULT '',
-                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-                )
-            """))
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id VARCHAR(36) PRIMARY KEY,
-                    session_id VARCHAR(36) NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    role VARCHAR(20) NOT NULL,
-                    content TEXT NOT NULL DEFAULT '',
-                    sources JSONB DEFAULT '[]'::jsonb,
-                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-                )
-            """))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id, created_at)"))
-            conn.commit()
 
     def _get_redis(self):
         if self._redis is not None:

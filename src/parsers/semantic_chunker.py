@@ -46,20 +46,105 @@ class SemanticChunker:
                              block_type / heading_level / page 信息。
     2. chunk_document():    输入原始 langchain Document，内部自动检测
                             Markdown 类标题、表格、列表结构。
+
+    chunk_size/chunk_overlap 未显式传入时，会按 file_path 的文件类型读取
+    config.yaml 中 document.per_type 的配置。
     """
 
     def __init__(
         self,
-        chunk_size: int = 512,
-        chunk_overlap: int = 50,
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None,
+        file_path: Optional[str] = None,
     ) -> None:
         """
         Args:
-            chunk_size:    每个分块的最大字符数。
-            chunk_overlap: 相邻分块之间的重叠字符数。
+            chunk_size:    每个分块的最大字符数。None 时按文件类型从
+                           config.yaml 的 document.per_type 获取。
+            chunk_overlap: 相邻分块之间的重叠字符数。None 时按文件类型从
+                           config.yaml 的 document.per_type 获取。
+            file_path:     用于确定文件类型并读取 per_type 配置的路径。
         """
-        self._chunk_size = chunk_size
-        self._chunk_overlap = chunk_overlap
+        resolved_size, resolved_overlap = self._resolve_chunk_params(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            file_path=file_path,
+        )
+        self._chunk_size = resolved_size
+        self._chunk_overlap = resolved_overlap
+
+    @staticmethod
+    def _resolve_chunk_params(
+        chunk_size: Optional[int],
+        chunk_overlap: Optional[int],
+        file_path: Optional[str],
+    ) -> Tuple[int, int]:
+        """Resolve explicit overrides or config-driven per-type defaults."""
+        cfg = get_config().document
+        suffix = Path(file_path).suffix.lower() if file_path else ""
+        configured_size, configured_overlap = cfg.get_chunk_params(suffix)
+        return (
+            chunk_size if chunk_size is not None else configured_size,
+            chunk_overlap if chunk_overlap is not None else configured_overlap,
+        )
+
+    @staticmethod
+    def _table_rows(content: str) -> List[str]:
+        return [line.strip() for line in content.splitlines() if line.strip()]
+
+    @staticmethod
+    def _table_column_count(content: str) -> int:
+        rows = SemanticChunker._table_rows(content)
+        if not rows:
+            return 0
+        return max(row.count(" | ") + 1 for row in rows)
+
+    @staticmethod
+    def _block_end_page(block: ParsedBlock) -> int:
+        extra = block.extra or {}
+        end_page = extra.get("table_end_page", extra.get("end_page", block.page))
+        return int(end_page) if end_page else block.page
+
+    @staticmethod
+    def _merge_cross_page_tables(blocks: List[ParsedBlock]) -> List[ParsedBlock]:
+        """Merge consecutive same-column table fragments on adjacent pages."""
+        merged: List[ParsedBlock] = []
+        for block in blocks:
+            if (
+                block.block_type == "table"
+                and merged
+                and merged[-1].block_type == "table"
+                and block.page == SemanticChunker._block_end_page(merged[-1]) + 1
+                and SemanticChunker._table_column_count(block.content)
+                == SemanticChunker._table_column_count(merged[-1].content)
+            ):
+                previous = merged.pop()
+                previous_rows = SemanticChunker._table_rows(previous.content)
+                current_rows = SemanticChunker._table_rows(block.content)
+                if (
+                    previous_rows
+                    and current_rows
+                    and previous_rows[0] == current_rows[0]
+                ):
+                    current_rows = current_rows[1:]
+
+                start_page = previous.page
+                end_page = block.page
+                merged.append(
+                    ParsedBlock(
+                        block_type="table",
+                        content="\n".join(previous_rows + current_rows),
+                        page=start_page,
+                        extra={
+                            **previous.extra,
+                            "table_start_page": start_page,
+                            "table_end_page": end_page,
+                        },
+                    )
+                )
+            else:
+                merged.append(block)
+        return merged
 
     # ── 模式一：输入 ParsedDocument ────────────────────────────────────
 
@@ -80,9 +165,19 @@ class SemanticChunker:
         heading_stack: List[Tuple[int, str]] = []  # [(level, title), ...]
         current_chunk: List[ParsedBlock] = []
         current_len = 0
+        current_page: Optional[int] = None
         chunks: List[Document] = []
 
-        for block in parsed.blocks:
+        blocks = self._merge_cross_page_tables(parsed.blocks)
+
+        for block in blocks:
+            if current_chunk and block.page != current_page:
+                chunks.append(self._finalize_chunk(current_chunk, parsed, heading_stack))
+                current_chunk = []
+                current_len = 0
+            if not current_chunk:
+                current_page = block.page
+
             if block.block_type == "heading":
                 # 标题是天然的切分点 —— 输出当前累积的 chunk
                 if current_chunk:
@@ -162,12 +257,16 @@ class SemanticChunker:
                 h2 = title
         section_title = f"{h1} > {h2}" if h2 else h1 or ""
 
-        # 页码：取第一个有 page 的块的页码
-        page = 1
-        for b in blocks:
-            if b.page > 1:
-                page = b.page
-                break
+        # 页码：记录块的首末页，兼容未来跨页 chunk 的过滤
+        page_starts = [b.page for b in blocks if b.page > 0]
+        page_ends = [self._block_end_page(b) for b in blocks]
+        start_page = min(page_starts) if page_starts else 1
+        end_page = max(page_ends) if page_ends else start_page
+        page_range = (
+            str(start_page)
+            if start_page == end_page
+            else f"{start_page}-{end_page}"
+        )
 
         # 权限标签：基于内容哈希虚构
         h = int(hashlib.md5(text.encode()).hexdigest()[:8], 16)
@@ -188,7 +287,11 @@ class SemanticChunker:
             "doc_id": parsed.doc_id,
             "source": parsed.source,
             "file_type": parsed.file_type,
-            "page": page,
+            "page": start_page,
+            "start_page": start_page,
+            "end_page": end_page,
+            "page_range": page_range,
+            "total_pages": parsed.total_pages,
             "section_title": section_title,
             "heading_stack": "/".join(t for _, t in heading_stack),
             "last_modified": last_modified,
@@ -301,12 +404,10 @@ def chunk_with_config(documents: List[Document]) -> List[Document]:
     Returns:
         语义分块后的 Document 列表。
     """
-    cfg = get_config().document
-    chunker = SemanticChunker(
-        chunk_size=cfg.chunk_size,
-        chunk_overlap=cfg.chunk_overlap,
-    )
     all_chunks: List[Document] = []
     for doc in documents:
+        chunker = SemanticChunker(
+            file_path=doc.metadata.get("file_path", ""),
+        )
         all_chunks.extend(chunker.chunk_document(doc))
     return all_chunks

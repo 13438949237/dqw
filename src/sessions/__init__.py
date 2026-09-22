@@ -1,3 +1,4 @@
 """会话管理模块。"""
 from src.sessions.session_manager import SessionManager
-__all__ = ["SessionManager"]
+from src.sessions.context_manager import ContextManager
+__all__ = ["SessionManager", "ContextManager"]

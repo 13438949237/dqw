@@ -21,7 +21,7 @@ models:
   # Reranker model
   reranker:
     provider: "huggingface"     # huggingface | cohere | jina
-    model_name: "BAAI/bge-reranker-v2-m3"
+    model_name: "D:/AiApplication/projects/Rag/models/bge-reranker-v2-m3"
     top_k: 10
     score_threshold: 0.5       # rerank 最低相关度阈值，低于此值的文档不返回(0 表示不过滤)
 
@@ -41,6 +41,8 @@ document:
   # 默认分块参数（未在 per_type 中配置的格式使用）
   default_chunk_size: 512
   default_chunk_overlap: 50
+  # Excel 文件超过该大小后直接逐 Sheet 解析，不再上传 MinerU
+  excel_mineru_max_mb: 20
   # 按文件类型独立配置分块参数
   per_type:
     md:    { chunk_size: 512, chunk_overlap: 64 }
@@ -76,7 +78,7 @@ cache:
   backend: "redis"             # redis | memory | disk
   redis_host: "localhost"
   redis_port: 6379
-  ttl_seconds: 3600
+  ttl_seconds: 86400
   semantic_enabled: true       # 是否启用语义缓存（需要 Redis Stack）
   similarity_threshold: 0.92   # 语义命中最低余弦相似度（0~1）
   vec_dim: 1024                # embedding 向量维度（须与模型匹配）
@@ -105,5 +107,11 @@ postgresql:
   host: "localhost"
   port: 5432
   user: rag_user
-  password: dqw19970501
+  password: rag_password
   database: "rag_sessions"
+
+# --- Session Context（会话上下文管理） ---
+session_context:
+  max_history_messages: 20   # 上下文窗口保留的消息数
+  max_context_tokens: 3000   # 拼入 Prompt 的历史 token 上限
+  summary_enabled: true      # token 超限时是否用 LLM 摘要压缩历史

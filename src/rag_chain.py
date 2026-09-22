@@ -84,6 +84,10 @@ DEFAULT_RAG_PROMPT = (
     "{context}\n"
     "--- 文档内容结束 ---\n"
     "\n"
+    "--- 对话历史 ---\n"
+    "{history}\n"
+    "--- 历史结束 ---\n"
+    "\n"
     "用户问题：{question}\n"
 )
 
@@ -131,9 +135,29 @@ class RAGChain:
             self._cache = CacheService()
         return self._cache
 
+    @staticmethod
+    def _build_history(history: Optional[List[Dict[str, Any]]]) -> str:
+        """构建多轮会话上下文（窗口截断 + 摘要压缩）。"""
+        if not history:
+            return "（无历史对话）"
+        try:
+            from src.sessions.context_manager import ContextManager
+            ctx = ContextManager()
+            text = ctx.build(history, history[-1].get("content", "") if history else "")
+            return text or "（无历史对话）"
+        except Exception as exc:
+            logger.warning("会话上下文构建失败，忽略历史: %s", exc)
+            return "（无历史对话）"
+
     # ── 主入口 ────────────────────────────────────────────────────────
 
-    def answer_stream(self, question: str) -> Generator[Dict[str, Any], None, None]:
+    def answer_stream(
+        self,
+        question: str,
+        history: Optional[List[Dict[str, Any]]] = None,
+        user_id: Optional[str] = None,
+        regenerate: bool = False,
+    ) -> Generator[Dict[str, Any], None, None]:
         """流式 RAG 问答：先检索，再流式生成。
 
         Yields:
@@ -148,12 +172,13 @@ class RAGChain:
             return
 
         # 1. 检查缓存
-        if self._use_cache:
+        if self._use_cache and not regenerate:
             try:
                 cache = self._get_cache()
-                cached = cache.get(question)
+                cached = cache.get(question, user_id=user_id)
                 if cached:
                     logger.info("缓存命中(流式): %s...", question[:40])
+                    yield {"type": "cached", "content": True}
                     yield {"type": "token", "content": cached.get("answer", "")}
                     yield {"type": "sources", "content": cached.get("source_metadata", [])}
                     yield {"type": "done", "content": cached.get("answer", "")}
@@ -180,7 +205,12 @@ class RAGChain:
 
         # 3. 构建 Prompt
         context = self._build_context(retrieved_docs) if retrieved_docs else "未检索到相关文档"
-        prompt = self._prompt_template.format(context=context, question=question)
+        history_text = self._build_history(history)
+        prompt = self._prompt_template.format(
+            context=context,
+            history=history_text,
+            question=question,
+        )
 
         # 4. 流式生成
         yield {"type": "status", "content": "💭 正在思考..."}
@@ -205,7 +235,11 @@ class RAGChain:
                     "answer": full_text,
                     "source_metadata": source_metadata,
                 }
-                self._get_cache().set(question, cache_entry)
+                self._get_cache().set(
+                    question,
+                    cache_entry,
+                    user_id=user_id,
+                )
             except Exception:
                 pass
 
@@ -231,11 +265,18 @@ class RAGChain:
 
         yield {"type": "done", "content": full_text}
 
-    def answer(self, question: str) -> Dict[str, Any]:
+    def answer(
+        self,
+        question: str,
+        history: Optional[List[Dict[str, Any]]] = None,
+        user_id: Optional[str] = None,
+        regenerate: bool = False,
+    ) -> Dict[str, Any]:
         """对用户问题执行完整的 RAG 问答流程。
 
         Args:
             question: 用户自然语言问题。
+            history:  多轮对话历史（可选），[{"role", "content"}, ...]。
 
         Returns:
             {
@@ -253,10 +294,10 @@ class RAGChain:
             return self._empty_result(question, "问题为空")
 
         # ── 1. 检查缓存 ──────────────────────────────────────────────
-        if self._use_cache:
+        if self._use_cache and not regenerate:
             try:
                 cache = self._get_cache()
-                cached = cache.get(question)
+                cached = cache.get(question, user_id=user_id)
                 if cached:
                     logger.info("缓存命中: %s...", question[:40])
                     result = dict(cached)
@@ -284,8 +325,10 @@ class RAGChain:
 
         # ── 3. 构建 Prompt ───────────────────────────────────────────
         context = self._build_context(retrieved_docs)
+        history_text = self._build_history(history)
         prompt = self._prompt_template.format(
             context=context,
+            history=history_text,
             question=question,
         )
 
@@ -339,7 +382,11 @@ class RAGChain:
                     "source_metadata": source_metadata,
                     "model": result["model"],
                 }
-                self._get_cache().set(question, cache_entry)
+                self._get_cache().set(
+                    question,
+                    cache_entry,
+                    user_id=user_id,
+                )
             except Exception as exc:
                 logger.warning("缓存写入失败: %s", exc)
 

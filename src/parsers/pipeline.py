@@ -19,9 +19,39 @@ from langchain_core.documents import Document
 from src.connectors.base import BaseConnector
 from src.parsers.semantic_chunker import SemanticChunker
 from src.parsers.smart_parser import parse_file, filter_chunks
-from src.utils.config import get_config
 
 logger = logging.getLogger(__name__)
+
+_STRUCTURED_METADATA_KEYS = frozenset({
+    "page",
+    "start_page",
+    "end_page",
+    "page_range",
+    "total_pages",
+    "section_title",
+    "heading_stack",
+})
+
+
+def _merge_connector_metadata(
+    chunks: List[Document],
+    connector_metadata: Dict,
+) -> None:
+    """Merge loader metadata without overwriting parser page structure."""
+    connector_meta = {
+        key: value
+        for key, value in connector_metadata.items()
+        if key != "page_content"
+    }
+    for chunk in chunks:
+        structured = {
+            key: chunk.metadata[key]
+            for key in _STRUCTURED_METADATA_KEYS
+            if key in chunk.metadata
+        }
+        chunk.metadata.update(connector_meta)
+        chunk.metadata.update(structured)
+
 
 def compute_file_hash(file_path: str) -> str:
     """计算文件 SHA256 指纹（取前 16 位，足够去重）。"""
@@ -34,7 +64,6 @@ def compute_file_hash(file_path: str) -> str:
 def _parse_and_chunk_single(
     file_path: str,
     source_name: str,
-    cfg,
 ) -> Tuple[str, List[Document], str]:
     """解析并分块单个文件（线程安全，供并行调用）。
 
@@ -42,12 +71,7 @@ def _parse_and_chunk_single(
         (source_name, chunks, file_hash)
     """
     file_hash = compute_file_hash(file_path)
-    suffix = Path(file_path).suffix.lower()
-    cs, co = cfg.document.get_chunk_params(suffix)
-    chunker = SemanticChunker(
-        chunk_size=cs or cfg.document.default_chunk_size,
-        chunk_overlap=co or cfg.document.default_chunk_overlap,
-    )
+    chunker = SemanticChunker(file_path=file_path)
 
     connector = _SimpleFileConnector(file_path)
     docs = connector.load_documents()
@@ -66,9 +90,8 @@ def _parse_and_chunk_single(
 
     chunks = filter_chunks(chunks)
 
-    connector_meta = {k: v for k, v in doc.metadata.items() if k != "page_content"}
+    _merge_connector_metadata(chunks, doc.metadata)
     for c in chunks:
-        c.metadata.update(connector_meta)
         c.metadata["file_hash"] = file_hash
 
     return source_name, chunks, file_hash
@@ -111,21 +134,23 @@ def load_and_chunk(
         return []
     logger.info("Pipeline start: %d documents", len(docs))
 
-    cfg = get_config().document
-    chunk_size = chunk_size or cfg.default_chunk_size
-    chunk_overlap = chunk_overlap or cfg.default_chunk_overlap
-
     def _get_chunker(file_path: str) -> SemanticChunker:
-        suffix = Path(file_path).suffix.lower()
-        cs, co = cfg.get_chunk_params(suffix)
-        return SemanticChunker(chunk_size=cs or chunk_size, chunk_overlap=co or chunk_overlap)
+        return SemanticChunker(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            file_path=file_path,
+        )
 
     all_chunks: List[Document] = []
+    processed_files: Set[str] = set()
 
     for doc in docs:
         file_path = doc.metadata.get("file_path", "")
 
         if smart_parse and file_path:
+            if file_path in processed_files:
+                continue
+            processed_files.add(file_path)
             chunker = _get_chunker(file_path)
             try:
                 parsed = parse_file(file_path)
@@ -141,9 +166,7 @@ def load_and_chunk(
 
         chunks = filter_chunks(chunks, min_chars=min_chars, max_whitespace_ratio=max_ws_ratio)
 
-        connector_meta = {k: v for k, v in doc.metadata.items() if k != "page_content"}
-        for c in chunks:
-            c.metadata.update(connector_meta)
+        _merge_connector_metadata(chunks, doc.metadata)
 
         all_chunks.extend(chunks)
 
@@ -152,7 +175,7 @@ def load_and_chunk(
         c.metadata["global_chunk_index"] = idx
         c.metadata["global_total_chunks"] = total
 
-    logger.info("Pipeline done: %d docs -> %d chunks (size=%d, overlap=%d)", len(docs), total, chunk_size, chunk_overlap)
+    logger.info("Pipeline done: %d docs -> %d chunks", len(docs), total)
     return all_chunks
 
 
@@ -188,7 +211,6 @@ def parallel_load_and_chunk(
     if source_names is None:
         source_names = [Path(p).name for p in file_paths]
 
-    cfg = get_config()
     file_reports: List[Dict[str, str]] = []
     pending: List[Tuple[str, str]] = []
 
@@ -216,7 +238,7 @@ def parallel_load_and_chunk(
 
     with ThreadPoolExecutor(max_workers=min(max_workers, total)) as executor:
         futures = {
-            executor.submit(_parse_and_chunk_single, fp, sn, cfg): (fp, sn)
+            executor.submit(_parse_and_chunk_single, fp, sn): (fp, sn)
             for fp, sn in pending
         }
 

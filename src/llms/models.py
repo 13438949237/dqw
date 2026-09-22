@@ -61,9 +61,27 @@ class _LocalCrossEncoderReranker(BaseReranker):
                 "pip install sentence-transformers"
             ) from exc
 
+        # 缩短 HuggingFace 下载超时与重试，避免网络受限时长时间假死
+        import os
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")
+        os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "10")
+        os.environ.setdefault("HF_HUB_MAX_RETRIES", "1")
+        os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+        # 限制 torch 线程数，降低与 pyarrow 内存池的冲突概率
+        try:
+            import torch
+            torch.set_num_threads(1)
+        except Exception:
+            pass
+
         self._model_name = model_name
         logger.info("加载本地重排序模型: %s", model_name)
+        logger.info("首次加载需数秒至数十秒（2GB 模型），请耐心等待...")
         self._model = CrossEncoder(model_name)
+        logger.info("本地重排序模型加载完成: %s", model_name)
 
     def rerank(
         self,
@@ -431,11 +449,10 @@ class ModelFactory:
         if cache_key in cls._reranker_cache:
             return cls._reranker_cache[cache_key]
 
-        # 回退链：HuggingFace 本地 → Cohere API → Jina API
-        fallback_chain = [
-            (provider, model_name),
-            ("huggingface", "BAAI/bge-reranker-v2-m3"),
-        ]
+        # 回退链：去重，避免同一模型重复尝试导致双倍等待
+        fallback_chain = [(provider, model_name)]
+        if provider != "huggingface":
+            fallback_chain.append(("huggingface", "BAAI/bge-reranker-v2-m3"))
 
         last_error: Optional[Exception] = None
 

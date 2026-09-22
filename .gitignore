@@ -39,6 +39,12 @@ logs/
 # Docker
 qdrant_data/
 redis_data/
+postgres_data/
+postgres_data_pg14_backup/
+postgres_data_pg16_backup/
+
+# Models
+models/
 
 # Streamlit
 .streamlit/secrets.toml

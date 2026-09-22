@@ -106,7 +106,9 @@ def retrieve(
 
     # ── 2. 重排序 ──────────────────────────────────────────────────────
     if use_reranker:
+        print("使用重排序，接下来加载模型")
         reranker = _get_reranker()
+        print("重排序模型加载完成:", reranker)
         results = reranker.rerank(query, candidates, top_k=top_k)
     else:
         results = candidates[:top_k]

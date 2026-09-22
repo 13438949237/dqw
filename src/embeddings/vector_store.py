@@ -326,7 +326,7 @@ class QdrantVectorStore:
         def _build_one(idx: int) -> None:
             doc = documents[idx]
             text = doc.page_content
-            point_id = str(uuid.uuid4())
+            point_id = str(uuid.uuid4()) # 向量数据库中chunk向量的ID
             dense_vec = all_dense_vecs[idx]
 
             sparse_indices, sparse_values = self._sparse_encoder.encode(text)

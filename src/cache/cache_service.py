@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import struct
 import threading
 import time
@@ -23,7 +24,7 @@ from src.utils.config import get_config
 
 logger = logging.getLogger(__name__)
 
-_SEMANTIC_INDEX = "rag:semantic_idx"
+_SEMANTIC_INDEX = "rag:semantic_idx_v2"
 _SEMANTIC_PREFIX = "rag:sem:"
 
 
@@ -40,7 +41,7 @@ class CacheService:
     def __init__(
         self,
         max_memory_entries: int = 1000,
-        default_ttl: int = 3600,
+        default_ttl: int = 86400,
     ) -> None:
         """
         Args:
@@ -107,7 +108,12 @@ class CacheService:
 
         try:
             from redis.commands.search.index_definition import IndexDefinition, IndexType
-            from redis.commands.search.field import VectorField, TextField, NumericField
+            from redis.commands.search.field import (
+                VectorField,
+                TextField,
+                NumericField,
+                TagField,
+            )
 
             try:
                 self._redis.ft(_SEMANTIC_INDEX).info()
@@ -127,6 +133,7 @@ class CacheService:
                     },
                 ),
                 TextField("question"),
+                TagField("scope"),
                 NumericField("created_at"),
             )
             definition = IndexDefinition(
@@ -162,10 +169,14 @@ class CacheService:
 
     # ── 公开接口 ──────────────────────────────────────────────────────
 
-    def get(self, question: str) -> Optional[Dict[str, Any]]:
+    def get(
+        self,
+        question: str,
+        user_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """查询缓存（精确匹配优先，未命中再语义匹配）。"""
         # ── 第一层：精确匹配 ──
-        exact_result = self._get_exact(question)
+        exact_result = self._get_exact(question, user_id)
         if exact_result is not None:
             logger.info("精确缓存命中: %s...", question[:40])
             return exact_result
@@ -173,7 +184,10 @@ class CacheService:
         # ── 第二层：语义匹配 ──
         logger.info("语义缓存初始化: %s", self._init_semantic_index())
         if self._init_semantic_index():
-            semantic_result = self._get_semantic(question)
+            semantic_result = self._get_semantic(
+                question,
+                self._user_scope(user_id),
+            )
             if semantic_result is not None:
                 return semantic_result
 
@@ -184,12 +198,19 @@ class CacheService:
             question: str,
             value: Dict[str, Any],
             ttl: Optional[int] = None,
+            user_id: Optional[str] = None,
     ) -> None:
         """写入缓存（精确层 + 语义层同时写入）。"""
-        self._set_exact(question, value, ttl)
+        ttl = ttl or get_config().cache.ttl_seconds
+        self._set_exact(question, value, ttl, user_id)
 
         if self._init_semantic_index():
-            self._set_semantic(question, value, ttl)
+            self._set_semantic(
+                question,
+                value,
+                ttl,
+                self._user_scope(user_id),
+            )
 
     def clear(self, pattern: Optional[str] = None) -> int:
         """清除缓存（精确层 + 语义层同时清空）。"""
@@ -247,8 +268,12 @@ class CacheService:
 
     # ── 内部：精确匹配层 ──────────────────────────────────────────────
 
-    def _get_exact(self, question: str) -> Optional[Dict[str, Any]]:
-        key = self._make_key(question)
+    def _get_exact(
+        self,
+        question: str,
+        user_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        key = self._make_key(question, user_id)
 
         if self._init_redis():
             try:
@@ -268,9 +293,13 @@ class CacheService:
         return None
 
     def _set_exact(
-            self, question: str, value: Dict[str, Any], ttl: Optional[int] = None
+            self,
+            question: str,
+            value: Dict[str, Any],
+            ttl: Optional[int] = None,
+            user_id: Optional[str] = None,
     ) -> None:
-        key = self._make_key(question)
+        key = self._make_key(question, user_id)
         ttl = ttl or self._default_ttl
 
         if self._init_redis():
@@ -292,7 +321,11 @@ class CacheService:
 
     # ── 内部：语义缓存层（Redis RediSearch 向量检索） ─────────────────
 
-    def _get_semantic(self, question: str) -> Optional[Dict[str, Any]]:
+    def _get_semantic(
+        self,
+        question: str,
+        scope: str,
+    ) -> Optional[Dict[str, Any]]:
         vec = self._get_embedding(question)
         if vec is None:
             return None
@@ -305,8 +338,8 @@ class CacheService:
             vec_bytes = self._float_list_to_bytes(vec)
 
             q = (
-                Query("*=>[KNN 1 @vec $query_vec AS score]")
-                .return_fields("score", "question", "value")
+                Query(f"@scope:{{{scope}}}=>[KNN 1 @vec $query_vec AS score]")
+                .return_fields("score", "question", "scope", "value")
                 .sort_by("score", asc=False)
                 .paging(0, 1)
                 .dialect(2)
@@ -338,7 +371,11 @@ class CacheService:
         return None
 
     def _set_semantic(
-            self, question: str, value: Dict[str, Any], ttl: Optional[int] = None
+            self,
+            question: str,
+            value: Dict[str, Any],
+            ttl: Optional[int] = None,
+            scope: str = "public",
     ) -> None:
         vec = self._get_embedding(question)
         if vec is None:
@@ -347,11 +384,13 @@ class CacheService:
         try:
             cfg = get_config().cache
             ttl = ttl or self._default_ttl
-            key = f"{_SEMANTIC_PREFIX}{hashlib.md5(question.encode('utf-8')).hexdigest()}"
+            raw_key = f"{scope}:{question.strip().lower()}"
+            key = f"{_SEMANTIC_PREFIX}{hashlib.md5(raw_key.encode('utf-8')).hexdigest()}"
 
             mapping = {
                 "vec": self._float_list_to_bytes(vec),
                 "question": question,
+                "scope": scope,
                 "value": json.dumps(value, ensure_ascii=False),
                 "created_at": str(int(time.time())),
             }
@@ -364,5 +403,22 @@ class CacheService:
     # ── 工具方法 ──────────────────────────────────────────────────────
 
     @staticmethod
-    def _make_key(question: str) -> str:
-        return f"rag:qa:{hashlib.md5(question.encode('utf-8')).hexdigest()}"
+    def _normalize_question(question: str) -> str:
+        return " ".join(question.strip().lower().split())
+
+    @staticmethod
+    def _user_scope(user_id: Optional[str]) -> str:
+        if not user_id:
+            return "public"
+        safe_user_id = re.sub(r"[^A-Za-z0-9_.-]", "_", user_id)
+        return f"user_{safe_user_id}"
+
+    @classmethod
+    def _make_key(
+        cls,
+        question: str,
+        user_id: Optional[str] = None,
+    ) -> str:
+        normalized = cls._normalize_question(question)
+        raw = f"{cls._user_scope(user_id)}:{normalized}"
+        return f"rag:qa:{hashlib.md5(raw.encode('utf-8')).hexdigest()}"
